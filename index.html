@@ -77,6 +77,9 @@ footer{display:flex;justify-content:center;gap:10px;padding:12px;border-top:1px 
 audio{display:none}
 .svol{position:absolute;left:10px;bottom:10px;display:flex;align-items:center;gap:8px;background:rgba(18,20,26,.85);border:1px solid var(--line);border-radius:8px;padding:5px 10px}
 .svol input{width:110px}
+.pct{font-size:12px;color:var(--muted);min-width:3.2em;text-align:right;font-variant-numeric:tabular-nums}
+.cvol{display:flex;align-items:center;gap:6px;width:100%;max-width:180px}
+.cvol input{flex:1;min-width:0}
 </style>
 </head>
 <body>
@@ -128,8 +131,8 @@ audio{display:none}
         <option value="1920x1080@60">1080p, 60 fps (games)</option>
         <option value="2560x1440@30">1440p, 30 fps</option>
       </select>
-      <label for="vol">Volume of others</label>
-      <input type="range" id="vol" min="0" max="1" step="0.05" value="1">
+      <label for="vol">Volume of everyone (voices and shared screens) <span class="pct" id="volPct">100%</span></label>
+      <input type="range" id="vol" min="0" max="200" step="5" value="100">
     </div>
   </footer>
 </div>
@@ -162,13 +165,48 @@ function broadcast(msg){ S.peers.forEach(e=>{ if(e.conn&&e.conn.open) e.conn.sen
 function entry(id){
   let e = S.peers.get(id);
   if(!e){
-    const audio = document.createElement('audio');
-    audio.autoplay = true; audio.volume = S.volume; audio.muted = S.deaf;
-    $('#audios').appendChild(audio);
-    e = {id, name:'Guest', conn:null, voiceCall:null, screenCall:null, stream:null, screen:null, muted:false, deaf:false, audio};
+    // vol = this person's voice volume, svol = their shared screen volume (1 = 100%, up to 2 = 200%)
+    e = {id, name:'Guest', conn:null, voiceCall:null, screenCall:null, stream:null, screen:null, muted:false, deaf:false, amp:null, vol:1, svol:1};
     S.peers.set(id,e);
   }
   return e;
+}
+
+/* ---------- volume ---------- */
+// Plays a remote stream through a Web Audio gain node, so volume can go above 100%.
+function makeAmp(stream){
+  // Chrome only feeds remote WebRTC audio into Web Audio if a media element also holds the stream
+  const raw = new Audio(); raw.muted = true; raw.srcObject = stream; raw.play().catch(()=>{});
+  const src = S.ac.createMediaStreamSource(stream);
+  const gain = S.ac.createGain();
+  const dest = S.ac.createMediaStreamDestination();
+  src.connect(gain); gain.connect(dest);
+  const el = document.createElement('audio');
+  el.autoplay = true; el.srcObject = dest.stream; el.muted = S.deaf;
+  $('#audios').appendChild(el);
+  // if the browser blocks autoplay, start sound on the next click
+  el.play().catch(()=>document.addEventListener('click', ()=>{ S.ac&&S.ac.resume(); el.play().catch(()=>{}); }, {once:true}));
+  return {
+    el,
+    set(v){ gain.gain.value = v; },
+    stop(){ try{ src.disconnect(); gain.disconnect(); }catch{} raw.srcObject = null; el.srcObject = null; el.remove(); }
+  };
+}
+function applyVolumes(){
+  S.peers.forEach(e=>{ if(e.amp) e.amp.set(e.vol*S.volume); });
+  document.querySelectorAll('#stage .screen').forEach(ch=>{
+    const e = S.peers.get(ch.dataset.key);
+    if(ch._amp && e) ch._amp.set(e.svol*S.volume);
+  });
+}
+function volSlider(value, label, onChange){
+  const rg = document.createElement('input'); rg.type='range'; rg.min=0; rg.max=200; rg.step=5;
+  rg.value = Math.round(value*100); rg.setAttribute('aria-label', label);
+  rg.title = 'Double-click to reset to 100%';
+  const pct = document.createElement('span'); pct.className='pct'; pct.textContent = rg.value+'%';
+  rg.oninput = ()=>{ pct.textContent = rg.value+'%'; onChange(rg.value/100); };
+  rg.ondblclick = ()=>{ rg.value = 100; rg.oninput(); };
+  return [rg, pct];
 }
 
 /* ---------- start / join ---------- */
@@ -283,9 +321,9 @@ function attachCall(id, call, type){
     call.on('stream', s=>{
       if(e.stream===s) return;
       e.stream = s;
-      e.audio.srcObject = s;
-      e.audio.muted = S.deaf;
-      e.audio.play().catch(()=>{});
+      if(e.amp) e.amp.stop();
+      e.amp = makeAmp(s);
+      applyVolumes();
       meter(id, s);
     });
   }else{
@@ -303,7 +341,7 @@ function removePeer(id){
   try{ e.voiceCall&&e.voiceCall.close(); }catch{}
   try{ e.screenCall&&e.screenCall.close(); }catch{}
   const sc = S.screenCalls.get(id); if(sc){ try{sc.close();}catch{} S.screenCalls.delete(id); }
-  e.audio.srcObject = null; e.audio.remove();
+  if(e.amp){ e.amp.stop(); e.amp = null; }
   S.meters.delete(id);
   setStatus(S.peers.size+1+' in room');
   render();
@@ -321,8 +359,8 @@ function toggleMute(){
 }
 function setDeaf(v){
   S.deaf = v;
-  S.peers.forEach(e=>e.audio.muted = v);
-  document.querySelectorAll('#stage video').forEach(vd=>{ if(!vd.dataset.mine) vd.muted = v; });
+  S.peers.forEach(e=>{ if(e.amp) e.amp.el.muted = v; });
+  document.querySelectorAll('#stage .screen').forEach(ch=>{ if(ch._amp) ch._amp.el.muted = v; });
 }
 function toggleDeaf(){
   if(!S.deaf){ S.wasMuted = S.muted; setDeaf(true); S.muted = true; }
@@ -430,6 +468,13 @@ function render(){
     b.textContent = (p.deaf?'🔇':'') + (p.muted&&!p.deaf?'🎙️🚫':'');
     d.appendChild(b);
     if(p.sharing){ const s=document.createElement('div'); s.className='badge-share'; s.textContent='Sharing'; d.appendChild(s); }
+    if(p.id!=='me'){
+      // volume of this person's voice
+      const e = S.peers.get(p.id);
+      const vb = document.createElement('div'); vb.className='cvol';
+      vb.append(...volSlider(e.vol, 'Voice volume of '+p.name, v=>{ e.vol = v; applyVolumes(); }));
+      d.appendChild(vb);
+    }
     list.appendChild(d);
   });
 
@@ -440,7 +485,7 @@ function render(){
   const stage = $('#stage');
   [...stage.children].forEach(ch=>{
     const w = want.get(ch.dataset.key);
-    if(!w || ch.querySelector('video').srcObject!==w.stream) ch.remove();
+    if(!w || ch.querySelector('video').srcObject!==w.stream){ if(ch._amp) ch._amp.stop(); ch.remove(); }
   });
   want.forEach((w,k)=>{
     let ch = [...stage.children].find(c=>c.dataset.key===k);
@@ -448,8 +493,8 @@ function render(){
       ch = document.createElement('div'); ch.className='screen'; ch.dataset.key=k;
       const v = document.createElement('video'); v.autoplay=true; v.playsInline=true;
       v.srcObject = w.stream;
-      if(w.mine){ v.muted=true; v.dataset.mine='1'; } else v.muted = S.deaf;
-      v.volume = S.volume;
+      v.muted = true; // sound plays through the volume control, never from the video itself
+      if(w.mine) v.dataset.mine='1';
       const tag = document.createElement('div'); tag.className='tag';
       const fs = document.createElement('button'); fs.className='fs'; fs.textContent='Full screen';
       fs.onclick = ()=> ch.requestFullscreen && ch.requestFullscreen();
@@ -459,21 +504,16 @@ function render(){
         // volume for this shared screen's sound
         const bar = document.createElement('div'); bar.className='svol';
         const ic = document.createElement('span'); ic.textContent='🔊';
-        const rg = document.createElement('input'); rg.type='range'; rg.min=0; rg.max=1; rg.step=0.05; rg.value=S.volume;
-        rg.setAttribute('aria-label','Volume of shared screen');
-        rg.oninput = ()=>{ v.volume = +rg.value; if(!S.deaf) v.muted = false; };
-        bar.append(ic,rg); ch.appendChild(bar);
+        const e = S.peers.get(k);
+        bar.append(ic, ...volSlider(e.svol, 'Volume of '+w.label, val=>{ e.svol = val; applyVolumes(); }));
+        ch.appendChild(bar);
       }
       stage.appendChild(ch);
-      // if the browser blocks sound autoplay, start muted and offer a button
-      v.play().catch(()=>{
-        v.muted = true; v.play().catch(()=>{});
-        const b = document.createElement('button'); b.className='fs'; b.style.top='46px'; b.textContent='Click to enable sound';
-        b.onclick = ()=>{ v.muted = S.deaf; v.play(); b.remove(); };
-        ch.appendChild(b);
-      });
+      v.play().catch(()=>{});
     }
-    const hasAudio = w.mine ? w.stream.getAudioTracks().length>0 : w.stream.getAudioTracks().length>0;
+    const hasAudio = w.stream.getAudioTracks().length>0;
+    // audio tracks can arrive after the video, so create the volume control once sound exists
+    if(!w.mine && hasAudio && !ch._amp){ ch._amp = makeAmp(w.stream); applyVolumes(); }
     ch.querySelector('.tag').textContent = w.label + (hasAudio ? '' : ' (no sound shared)');
     const sv = ch.querySelector('.svol'); if(sv) sv.style.display = hasAudio ? '' : 'none';
   });
@@ -528,6 +568,7 @@ function leave(msg){
   $('#settings').classList.add('hidden');
   $('#room').classList.add('hidden');
   $('#join').classList.remove('hidden');
+  document.querySelectorAll('#stage .screen').forEach(ch=>{ if(ch._amp) ch._amp.stop(); });
   $('#stage').innerHTML='';
   setErr(msg||'');
 }
@@ -542,7 +583,7 @@ $('#btnShare').onclick  = toggleShare;
 $('#btnLeave').onclick  = ()=>leave();
 $('#btnSet').onclick    = ()=>$('#settings').classList.toggle('hidden');
 $('#micSel').onchange   = changeMic;
-$('#vol').oninput       = e=>{ S.volume=+e.target.value; S.peers.forEach(p=>p.audio.volume=S.volume); document.querySelectorAll('#stage video').forEach(v=>{ if(!v.dataset.mine) v.volume=S.volume; }); };
+$('#vol').oninput       = e=>{ S.volume = e.target.value/100; $('#volPct').textContent = e.target.value+'%'; applyVolumes(); };
 $('#btnCopy').onclick   = async ()=>{
   const link = location.protocol.startsWith('http') ? location.origin+location.pathname+'#'+S.code : S.code;
   try{ await navigator.clipboard.writeText(link); $('#btnCopy').textContent='Copied'; }
