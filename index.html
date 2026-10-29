@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voicedle: voice and screen sharing</title>
+<style>
+:root{
+  --bg:#12141a; --panel:#1b1e26; --panel2:#232733; --line:#2c3140;
+  --text:#e8eaf0; --muted:#8c94a6; --accent:#6f8cff; --live:#3fd68f;
+  --warn:#ffb454; --danger:#ef5b61;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--text);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+button,input,select{font:inherit;color:inherit}
+button{cursor:pointer}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.hidden{display:none!important}
+
+/* ---------- Join screen ---------- */
+#join{min-height:100%;display:grid;place-items:center;padding:24px}
+.join-card{width:min(420px,100%);background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:28px}
+.join-card h1{margin:0 0 4px;font-size:26px;letter-spacing:-.02em}
+.join-card p{margin:0 0 22px;color:var(--muted)}
+label{display:block;font-size:13px;color:var(--muted);margin:14px 0 6px}
+input[type=text]{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+input[type=text]#code{letter-spacing:.2em;text-transform:uppercase}
+.row{display:flex;gap:10px;margin-top:20px}
+.btn{border:1px solid var(--line);background:var(--panel2);border-radius:8px;padding:10px 14px}
+.btn:hover{background:#2b3040}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#0c1020;font-weight:600}
+.btn.primary:hover{background:#8aa2ff}
+.row .btn{flex:1}
+#err{margin-top:14px;color:var(--danger);min-height:1.4em;font-size:14px}
+.hint{margin-top:18px;font-size:13px;color:var(--muted)}
+
+/* ---------- Room ---------- */
+#room{height:100%;display:flex;flex-direction:column}
+header{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
+header .title{font-weight:600}
+.code{font-family:ui-monospace,Menlo,Consolas,monospace;letter-spacing:.14em;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:3px 10px}
+header .spacer{flex:1}
+#status{font-size:13px;color:var(--muted)}
+#main{flex:1;min-height:0;display:flex;flex-direction:column;padding:12px;gap:12px}
+#stage{flex:1;min-height:0;display:none;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:12px}
+#main.has-stage #stage{display:grid}
+.screen{position:relative;background:#000;border:1px solid var(--line);border-radius:10px;overflow:hidden;min-height:180px}
+.screen video{width:100%;height:100%;object-fit:contain;background:#000;display:block}
+.screen .tag{position:absolute;left:10px;top:10px;background:rgba(18,20,26,.8);border:1px solid var(--line);border-radius:6px;padding:3px 9px;font-size:13px}
+.screen .fs{position:absolute;right:10px;top:10px;background:rgba(18,20,26,.8);border:1px solid var(--line);border-radius:6px;padding:3px 9px;font-size:13px}
+#people{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;align-content:center;flex:1;min-height:0;overflow:auto}
+#main.has-stage #people{flex:none;display:flex;gap:10px;overflow-x:auto;align-content:unset}
+.card{position:relative;background:var(--panel);border:1px solid var(--line);border-radius:12px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:22px 12px;min-height:150px;transition:box-shadow .12s,border-color .12s}
+#main.has-stage .card{flex:0 0 150px;min-height:0;padding:12px 8px;gap:6px}
+.card.speaking{border-color:var(--live);box-shadow:0 0 0 2px var(--live)}
+.avatar{width:64px;height:64px;border-radius:50%;display:grid;place-items:center;font-size:26px;font-weight:600;color:#0c1020}
+#main.has-stage .avatar{width:40px;height:40px;font-size:18px}
+.name{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px}
+.badges{position:absolute;right:8px;top:8px;display:flex;gap:4px;font-size:13px}
+.badge-share{position:absolute;left:8px;top:8px;font-size:12px;background:var(--warn);color:#201400;border-radius:5px;padding:1px 7px;font-weight:600}
+
+/* ---------- Controls ---------- */
+footer{display:flex;justify-content:center;gap:10px;padding:12px;border-top:1px solid var(--line);background:var(--panel);position:relative}
+.ctl{display:flex;align-items:center;gap:8px;border:1px solid var(--line);background:var(--panel2);border-radius:999px;padding:10px 18px}
+.ctl:hover{background:#2b3040}
+.ctl.off{background:var(--danger);border-color:var(--danger);color:#fff}
+.ctl.on{background:var(--warn);border-color:var(--warn);color:#201400;font-weight:600}
+.ctl.leave{background:var(--danger);border-color:var(--danger);color:#fff}
+.ctl .ic{font-size:17px}
+@media (max-width:640px){.ctl span.lbl{display:none}.ctl{padding:12px 14px}}
+#settings{position:absolute;bottom:68px;left:50%;transform:translateX(-50%);width:min(340px,92vw);background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;box-shadow:0 12px 40px rgba(0,0,0,.5);z-index:5}
+#settings label:first-child{margin-top:0}
+#settings select{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px}
+#settings input[type=range]{width:100%}
+audio{display:none}
+.svol{position:absolute;left:10px;bottom:10px;display:flex;align-items:center;gap:8px;background:rgba(18,20,26,.85);border:1px solid var(--line);border-radius:8px;padding:5px 10px}
+.svol input{width:110px}
+</style>
+</head>
+<body>
+
+<!-- Join -->
+<div id="join">
+  <div class="join-card">
+    <h1>Voicedle</h1>
+    <p>Talk by voice and share your screen, right in the browser.</p>
+    <label for="name">Your name</label>
+    <input type="text" id="name" maxlength="24" placeholder="e.g. Ana" autocomplete="nickname">
+    <label for="code">Room code (only to join an existing room)</label>
+    <input type="text" id="code" maxlength="6" placeholder="ABC123" autocomplete="off">
+    <div class="row">
+      <button class="btn primary" id="btnCreate">Create room</button>
+      <button class="btn" id="btnJoin">Join room</button>
+    </div>
+    <div id="err" role="alert"></div>
+    <div class="hint">Your browser will ask for microphone access. Share the room code with friends so they can join.</div>
+  </div>
+</div>
+
+<!-- Room -->
+<div id="room" class="hidden">
+  <header>
+    <span class="title">Voicedle</span>
+    <span class="code" id="roomCode"></span>
+    <button class="btn" id="btnCopy">Copy code</button>
+    <span class="spacer"></span>
+    <span id="status"></span>
+  </header>
+  <div id="main">
+    <div id="stage"></div>
+    <div id="people"></div>
+  </div>
+  <footer>
+    <button class="ctl" id="btnMic"><span class="ic">🎤</span><span class="lbl">Mute</span></button>
+    <button class="ctl" id="btnDeaf"><span class="ic">🎧</span><span class="lbl">Deafen</span></button>
+    <button class="ctl" id="btnShare"><span class="ic">🖥️</span><span class="lbl">Share screen</span></button>
+    <button class="ctl" id="btnSet"><span class="ic">⚙️</span><span class="lbl">Settings</span></button>
+    <button class="ctl leave" id="btnLeave"><span class="ic">📞</span><span class="lbl">Leave</span></button>
+    <div id="settings" class="hidden">
+      <label for="micSel">Microphone</label>
+      <select id="micSel"></select>
+      <label for="qSel">Screen share quality</label>
+      <select id="qSel">
+        <option value="1280x720@30">720p, 30 fps</option>
+        <option value="1920x1080@30" selected>1080p, 30 fps</option>
+        <option value="1920x1080@60">1080p, 60 fps (games)</option>
+        <option value="2560x1440@30">1440p, 30 fps</option>
+      </select>
+      <label for="vol">Volume of others</label>
+      <input type="range" id="vol" min="0" max="1" step="0.05" value="1">
+    </div>
+  </footer>
+</div>
+<div id="audios"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+const $ = s => document.querySelector(s);
+const PREFIX = 'voicedle-';
+const S = {
+  peer:null, myId:null, local:null, name:'', code:'', hostId:'', isHost:false,
+  peers:new Map(), screen:null, screenCalls:new Map(),
+  muted:false, deaf:false, wasMuted:false, volume:1,
+  ac:null, meters:new Map(), meterTimer:null
+};
+
+/* ---------- helpers ---------- */
+function genCode(){
+  const a='ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  return Array.from({length:6},()=>a[Math.floor(Math.random()*a.length)]).join('');
+}
+function color(name){
+  let h=0; for(const c of name) h=(h*31+c.charCodeAt(0))>>>0;
+  return `hsl(${h%360} 70% 72%)`;
+}
+function setErr(m){ $('#err').textContent = m||''; }
+function setStatus(m){ $('#status').textContent = m||''; }
+function broadcast(msg){ S.peers.forEach(e=>{ if(e.conn&&e.conn.open) e.conn.send(msg); }); }
+
+function entry(id){
+  let e = S.peers.get(id);
+  if(!e){
+    const audio = document.createElement('audio');
+    audio.autoplay = true; audio.volume = S.volume; audio.muted = S.deaf;
+    $('#audios').appendChild(audio);
+    e = {id, name:'Guest', conn:null, voiceCall:null, screenCall:null, stream:null, screen:null, muted:false, deaf:false, audio};
+    S.peers.set(id,e);
+  }
+  return e;
+}
+
+/* ---------- start / join ---------- */
+async function getMic(deviceId){
+  return navigator.mediaDevices.getUserMedia({
+    audio:{ deviceId: deviceId?{exact:deviceId}:undefined, echoCancellation:true, noiseSuppression:true, autoGainControl:true },
+    video:false
+  });
+}
+
+async function start(create){
+  setErr('');
+  const name = $('#name').value.trim() || 'Guest'+Math.floor(100+Math.random()*900);
+  let code = $('#code').value.trim().toUpperCase();
+  if(!create && code.length<4){ setErr('Enter the room code you received.'); return; }
+  if(typeof Peer==='undefined'){ setErr('Could not load the connection library. Check your internet connection and reload.'); return; }
+  try{ S.local = await getMic(); }
+  catch(e){ setErr('Microphone access is needed. Allow it in the browser address bar and try again.'); return; }
+  S.name = name;
+  S.ac = new (window.AudioContext||window.webkitAudioContext)();
+  S.ac.resume();
+  S.isHost = create;
+  if(create) code = genCode();
+  S.code = code;
+  S.hostId = PREFIX+code.toLowerCase();
+  openPeer(create ? S.hostId : undefined);
+  setStatus('Connecting…');
+}
+
+function openPeer(id){
+  const p = new Peer(id, {debug:0});
+  S.peer = p;
+  p.on('open', myId=>{
+    S.myId = myId;
+    enterRoom();
+    if(!S.isHost) connectTo(S.hostId);
+    setStatus(S.isHost ? 'Waiting for others to join' : 'Connected');
+  });
+  p.on('connection', setupConn);
+  p.on('call', onCall);
+  p.on('disconnected', ()=>{ try{p.reconnect();}catch{} });
+  p.on('error', e=>{
+    if(e.type==='unavailable-id' && S.isHost){
+      p.destroy(); S.code=genCode(); S.hostId=PREFIX+S.code.toLowerCase(); openPeer(S.hostId); return;
+    }
+    if(e.type==='peer-unavailable' && String(e.message).includes(S.hostId)){
+      leave('Room not found. Check the code, and make sure the person who created it is still in the room.'); return;
+    }
+    if(e.type==='network'||e.type==='server-error'||e.type==='socket-error'){
+      setStatus('Connection problem, retrying…');
+    }
+  });
+}
+
+function enterRoom(){
+  $('#join').classList.add('hidden');
+  $('#room').classList.remove('hidden');
+  $('#roomCode').textContent = S.code;
+  meter('me', S.local);
+  startMeterLoop();
+  loadDevices();
+  render();
+}
+
+/* ---------- connections ---------- */
+function connectTo(id){
+  if(id===S.myId) return;
+  const ex = S.peers.get(id);
+  if(ex && ex.conn) return;
+  const c = S.peer.connect(id,{reliable:true});
+  setupConn(c);
+  const call = S.peer.call(id, S.local, {metadata:{type:'voice'}});
+  attachCall(id, call, 'voice');
+}
+
+function setupConn(c){
+  const e = entry(c.peer);
+  e.conn = c;
+  c.on('open', ()=>{
+    c.send({t:'hello', name:S.name, muted:S.muted, deaf:S.deaf});
+    if(S.isHost){
+      c.send({t:'peers', list:[...S.peers.values()].filter(x=>x.id!==c.peer && x.conn && x.conn.open).map(x=>x.id)});
+    }
+    if(S.screen) shareTo(c.peer);
+    setStatus(S.peers.size+1+' in room');
+    render();
+  });
+  c.on('data', d=>onData(c.peer,d));
+  c.on('close', ()=>removePeer(c.peer));
+  c.on('error', ()=>removePeer(c.peer));
+}
+
+function onData(id,d){
+  const e = entry(id);
+  if(d.t==='hello'){ e.name=d.name; e.muted=d.muted; e.deaf=d.deaf; }
+  else if(d.t==='state'){ e.muted=d.muted; e.deaf=d.deaf; }
+  else if(d.t==='peers'){ d.list.forEach(pid=>{ if(pid!==S.myId) connectTo(pid); }); }
+  else if(d.t==='screen-stop'){ e.screen=null; if(e.screenCall){ try{e.screenCall.close();}catch{} e.screenCall=null; } }
+  render();
+}
+
+function onCall(call){
+  const type = call.metadata && call.metadata.type;
+  if(type==='screen') call.answer(); else call.answer(S.local);
+  attachCall(call.peer, call, type==='screen'?'screen':'voice');
+}
+
+function attachCall(id, call, type){
+  const e = entry(id);
+  if(type==='voice'){
+    e.voiceCall = call;
+    call.on('stream', s=>{
+      if(e.stream===s) return;
+      e.stream = s;
+      e.audio.srcObject = s;
+      e.audio.muted = S.deaf;
+      e.audio.play().catch(()=>{});
+      meter(id, s);
+    });
+  }else{
+    e.screenCall = call;
+    call.on('stream', s=>{ if(e.screen!==s){ e.screen=s; s.addEventListener('addtrack', render); render(); } });
+    call.on('close', ()=>{ e.screen=null; render(); });
+  }
+}
+
+function removePeer(id){
+  const e = S.peers.get(id);
+  if(!e) return;
+  S.peers.delete(id);
+  try{ e.conn&&e.conn.close(); }catch{}
+  try{ e.voiceCall&&e.voiceCall.close(); }catch{}
+  try{ e.screenCall&&e.screenCall.close(); }catch{}
+  const sc = S.screenCalls.get(id); if(sc){ try{sc.close();}catch{} S.screenCalls.delete(id); }
+  e.audio.srcObject = null; e.audio.remove();
+  S.meters.delete(id);
+  setStatus(S.peers.size+1+' in room');
+  render();
+}
+
+/* ---------- mute / deafen ---------- */
+function applyMute(){
+  S.local.getAudioTracks().forEach(t=>t.enabled = !S.muted);
+}
+function pushState(){ broadcast({t:'state', muted:S.muted, deaf:S.deaf}); }
+function toggleMute(){
+  S.muted = !S.muted;
+  if(!S.muted && S.deaf) setDeaf(false);
+  applyMute(); pushState(); render();
+}
+function setDeaf(v){
+  S.deaf = v;
+  S.peers.forEach(e=>e.audio.muted = v);
+  document.querySelectorAll('#stage video').forEach(vd=>{ if(!vd.dataset.mine) vd.muted = v; });
+}
+function toggleDeaf(){
+  if(!S.deaf){ S.wasMuted = S.muted; setDeaf(true); S.muted = true; }
+  else { setDeaf(false); S.muted = S.wasMuted; }
+  applyMute(); pushState(); render();
+}
+
+/* ---------- screen sharing ---------- */
+async function toggleShare(){
+  if(S.screen){ stopShare(); return; }
+  if(!navigator.mediaDevices.getDisplayMedia){ alert('Your browser does not support screen sharing. Use a desktop version of Chrome, Edge, or Firefox.'); return; }
+  const m = $('#qSel').value.match(/(\d+)x(\d+)@(\d+)/);
+  try{
+    S.screen = await navigator.mediaDevices.getDisplayMedia({
+      video:{ width:{ideal:+m[1]}, height:{ideal:+m[2]}, frameRate:{ideal:+m[3]} },
+      // raw, unprocessed audio so game sound is not filtered like a voice
+      audio:{ echoCancellation:false, noiseSuppression:false, autoGainControl:false, channelCount:2 },
+      systemAudio:'include',
+      suppressLocalAudioPlayback:false
+    });
+  }catch(e){ return; } // person closed the picker
+  if(!S.screen.getAudioTracks().length){
+    setStatus('Sharing WITHOUT sound. In the picker, choose a tab or Entire screen and tick “Share audio”.');
+    setTimeout(()=>setStatus(S.peers.size+1+' in room'), 12000);
+  }
+  const vt = S.screen.getVideoTracks()[0];
+  vt.contentHint = 'motion';
+  vt.addEventListener('ended', stopShare);
+  S.peers.forEach((e,id)=>{ if(e.conn && e.conn.open) shareTo(id); });
+  render();
+}
+function shareTo(id){
+  if(S.screenCalls.has(id)) return;
+  const call = S.peer.call(id, S.screen, {
+    metadata:{type:'screen'},
+    // stereo, high-bitrate Opus so game audio and music sound right
+    sdpTransform: sdp => sdp.replace(/a=fmtp:(\d+) ([^\r\n]*)/g, (line, pt, params) =>
+      /useinbandfec/.test(params) && !/stereo=1/.test(params)
+        ? `a=fmtp:${pt} ${params};stereo=1;sprop-stereo=1;maxaveragebitrate=192000`
+        : line)
+  });
+  S.screenCalls.set(id, call);
+  // raise the video bitrate so text and games stay sharp
+  setTimeout(()=>{
+    try{
+      call.peerConnection.getSenders().forEach(s=>{
+        if(s.track && s.track.kind==='video'){
+          const p = s.getParameters(); if(!p.encodings||!p.encodings.length) p.encodings=[{}];
+          p.encodings[0].maxBitrate = 6000000;
+          s.setParameters(p);
+        }else if(s.track && s.track.kind==='audio'){
+          const p = s.getParameters(); if(!p.encodings||!p.encodings.length) p.encodings=[{}];
+          p.encodings[0].maxBitrate = 192000;
+          s.setParameters(p);
+        }
+      });
+    }catch{}
+  }, 800);
+}
+function stopShare(){
+  if(!S.screen) return;
+  S.screen.getTracks().forEach(t=>t.stop());
+  S.screen = null;
+  S.screenCalls.forEach(c=>{ try{c.close();}catch{} });
+  S.screenCalls.clear();
+  broadcast({t:'screen-stop'});
+  render();
+}
+
+/* ---------- speaking detection ---------- */
+function meter(id, stream){
+  try{
+    const src = S.ac.createMediaStreamSource(stream);
+    const an = S.ac.createAnalyser(); an.fftSize = 512;
+    src.connect(an);
+    S.meters.set(id, {an, buf:new Uint8Array(an.fftSize)});
+  }catch{}
+}
+function startMeterLoop(){
+  clearInterval(S.meterTimer);
+  S.meterTimer = setInterval(()=>{
+    S.meters.forEach((m,id)=>{
+      m.an.getByteTimeDomainData(m.buf);
+      let sum=0; for(const v of m.buf){ const x=(v-128)/128; sum+=x*x; }
+      const speaking = Math.sqrt(sum/m.buf.length) > 0.035 && !(id==='me' && S.muted);
+      const el = document.getElementById('tile-'+id);
+      if(el) el.classList.toggle('speaking', speaking);
+    });
+  }, 100);
+}
+
+/* ---------- rendering ---------- */
+function render(){
+  // participants
+  const list = $('#people'); list.innerHTML='';
+  const all = [{id:'me', name:S.name+' (you)', muted:S.muted, deaf:S.deaf, sharing:!!S.screen}]
+    .concat([...S.peers.values()].map(e=>({id:e.id, name:e.name, muted:e.muted, deaf:e.deaf, sharing:!!e.screen})));
+  all.forEach(p=>{
+    const d = document.createElement('div'); d.className='card'; d.id='tile-'+p.id;
+    const av = document.createElement('div'); av.className='avatar'; av.style.background=color(p.name);
+    av.textContent = (p.name.trim()[0]||'?').toUpperCase();
+    const nm = document.createElement('div'); nm.className='name'; nm.textContent=p.name;
+    d.append(av,nm);
+    const b = document.createElement('div'); b.className='badges';
+    b.textContent = (p.deaf?'🔇':'') + (p.muted&&!p.deaf?'🎙️🚫':'');
+    d.appendChild(b);
+    if(p.sharing){ const s=document.createElement('div'); s.className='badge-share'; s.textContent='Sharing'; d.appendChild(s); }
+    list.appendChild(d);
+  });
+
+  // screens
+  const want = new Map();
+  if(S.screen) want.set('me',{stream:S.screen,label:'Your screen',mine:true});
+  S.peers.forEach(e=>{ if(e.screen) want.set(e.id,{stream:e.screen,label:e.name+'’s screen'}); });
+  const stage = $('#stage');
+  [...stage.children].forEach(ch=>{
+    const w = want.get(ch.dataset.key);
+    if(!w || ch.querySelector('video').srcObject!==w.stream) ch.remove();
+  });
+  want.forEach((w,k)=>{
+    let ch = [...stage.children].find(c=>c.dataset.key===k);
+    if(!ch){
+      ch = document.createElement('div'); ch.className='screen'; ch.dataset.key=k;
+      const v = document.createElement('video'); v.autoplay=true; v.playsInline=true;
+      v.srcObject = w.stream;
+      if(w.mine){ v.muted=true; v.dataset.mine='1'; } else v.muted = S.deaf;
+      v.volume = S.volume;
+      const tag = document.createElement('div'); tag.className='tag';
+      const fs = document.createElement('button'); fs.className='fs'; fs.textContent='Full screen';
+      fs.onclick = ()=> ch.requestFullscreen && ch.requestFullscreen();
+      v.ondblclick = fs.onclick;
+      ch.append(v,tag,fs);
+      if(!w.mine){
+        // volume for this shared screen's sound
+        const bar = document.createElement('div'); bar.className='svol';
+        const ic = document.createElement('span'); ic.textContent='🔊';
+        const rg = document.createElement('input'); rg.type='range'; rg.min=0; rg.max=1; rg.step=0.05; rg.value=S.volume;
+        rg.setAttribute('aria-label','Volume of shared screen');
+        rg.oninput = ()=>{ v.volume = +rg.value; if(!S.deaf) v.muted = false; };
+        bar.append(ic,rg); ch.appendChild(bar);
+      }
+      stage.appendChild(ch);
+      // if the browser blocks sound autoplay, start muted and offer a button
+      v.play().catch(()=>{
+        v.muted = true; v.play().catch(()=>{});
+        const b = document.createElement('button'); b.className='fs'; b.style.top='46px'; b.textContent='Click to enable sound';
+        b.onclick = ()=>{ v.muted = S.deaf; v.play(); b.remove(); };
+        ch.appendChild(b);
+      });
+    }
+    const hasAudio = w.mine ? w.stream.getAudioTracks().length>0 : w.stream.getAudioTracks().length>0;
+    ch.querySelector('.tag').textContent = w.label + (hasAudio ? '' : ' (no sound shared)');
+    const sv = ch.querySelector('.svol'); if(sv) sv.style.display = hasAudio ? '' : 'none';
+  });
+  $('#main').classList.toggle('has-stage', want.size>0);
+
+  // controls
+  const mic=$('#btnMic'); mic.classList.toggle('off',S.muted);
+  mic.querySelector('.lbl').textContent = S.muted?'Unmute':'Mute';
+  mic.querySelector('.ic').textContent = S.muted?'🔇':'🎤';
+  const df=$('#btnDeaf'); df.classList.toggle('off',S.deaf);
+  df.querySelector('.lbl').textContent = S.deaf?'Undeafen':'Deafen';
+  const sh=$('#btnShare'); sh.classList.toggle('on',!!S.screen);
+  sh.querySelector('.lbl').textContent = S.screen?'Stop sharing':'Share screen';
+}
+
+/* ---------- settings ---------- */
+async function loadDevices(){
+  try{
+    const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==='audioinput');
+    const sel = $('#micSel'); sel.innerHTML='';
+    const cur = S.local.getAudioTracks()[0].getSettings().deviceId;
+    devs.forEach((d,i)=>{
+      const o=document.createElement('option'); o.value=d.deviceId; o.textContent=d.label||('Microphone '+(i+1));
+      if(d.deviceId===cur) o.selected=true; sel.appendChild(o);
+    });
+  }catch{}
+}
+async function changeMic(){
+  try{
+    const ns = await getMic($('#micSel').value);
+    const nt = ns.getAudioTracks()[0]; nt.enabled = !S.muted;
+    S.peers.forEach(e=>{
+      if(e.voiceCall && e.voiceCall.peerConnection){
+        const snd = e.voiceCall.peerConnection.getSenders().find(s=>s.track && s.track.kind==='audio');
+        if(snd) snd.replaceTrack(nt);
+      }
+    });
+    S.local.getTracks().forEach(t=>t.stop());
+    S.local = ns; meter('me', ns);
+  }catch(e){ alert('Could not switch microphone.'); }
+}
+
+/* ---------- leave ---------- */
+function leave(msg){
+  stopShare();
+  Array.from(S.peers.keys()).forEach(removePeer);
+  try{ S.peer&&S.peer.destroy(); }catch{}
+  if(S.local) S.local.getTracks().forEach(t=>t.stop());
+  clearInterval(S.meterTimer); S.meters.clear();
+  try{ S.ac&&S.ac.close(); }catch{}
+  S.peer=null; S.local=null; S.ac=null; S.muted=false; S.deaf=false;
+  $('#settings').classList.add('hidden');
+  $('#room').classList.add('hidden');
+  $('#join').classList.remove('hidden');
+  $('#stage').innerHTML='';
+  setErr(msg||'');
+}
+
+/* ---------- wire up ---------- */
+$('#btnCreate').onclick = ()=>start(true);
+$('#btnJoin').onclick   = ()=>start(false);
+$('#code').addEventListener('keydown',e=>{ if(e.key==='Enter') start(false); });
+$('#btnMic').onclick    = toggleMute;
+$('#btnDeaf').onclick   = toggleDeaf;
+$('#btnShare').onclick  = toggleShare;
+$('#btnLeave').onclick  = ()=>leave();
+$('#btnSet').onclick    = ()=>$('#settings').classList.toggle('hidden');
+$('#micSel').onchange   = changeMic;
+$('#vol').oninput       = e=>{ S.volume=+e.target.value; S.peers.forEach(p=>p.audio.volume=S.volume); document.querySelectorAll('#stage video').forEach(v=>{ if(!v.dataset.mine) v.volume=S.volume; }); };
+$('#btnCopy').onclick   = async ()=>{
+  const link = location.protocol.startsWith('http') ? location.origin+location.pathname+'#'+S.code : S.code;
+  try{ await navigator.clipboard.writeText(link); $('#btnCopy').textContent='Copied'; }
+  catch{ prompt('Copy this:', link); }
+  setTimeout(()=>$('#btnCopy').textContent='Copy code',1500);
+};
+window.addEventListener('beforeunload',()=>{ try{S.peer&&S.peer.destroy();}catch{} });
+if(location.hash.length>1) $('#code').value = location.hash.slice(1).toUpperCase();
+</script>
+</body>
+</html>
