@@ -205,6 +205,8 @@ audio{display:none}
       <label for="vol">Volume of everyone (voices and shared screens) <span class="pct" id="volPct">100%</span></label>
       <input type="range" id="vol" min="0" max="500" step="5" value="100">
       <label class="chk"><input type="checkbox" id="sfx" checked> Sound effects (joins, leaves, mute, sharing, messages)</label>
+      <label for="sfxVol">Sound effects volume <span class="pct" id="sfxPct">100%</span></label>
+      <input type="range" id="sfxVol" min="0" max="200" step="5" value="100">
     </div>
   </footer>
 </div>
@@ -306,22 +308,36 @@ const SFX = {
   camOff:   [[880,0,.08],[659,.07,.14]],
   msg:      [[988,0,.06],[1319,.05,.1]]
 };
+// how loud each sound is (1 = loudest); joins and leaves are the most important
+const SFX_LEVEL = {join:1, leave:1, shareOn:.8, shareOff:.8, camOn:.75, camOff:.75, msg:.7};
 const sfxLast = {};
+// all sounds go through a limiter, so overlapping notes never distort
+function sfxBus(ac){
+  if(S.sfxBus && S.sfxBus.ac===ac) return S.sfxBus.node;
+  const lim = ac.createDynamicsCompressor();
+  lim.threshold.value = -2; lim.knee.value = 2; lim.ratio.value = 20; lim.attack.value = 0.001; lim.release.value = 0.1;
+  lim.connect(ac.destination);
+  S.sfxBus = {ac, node:lim};
+  return lim;
+}
 function sfx(name){
   const ac = S.ac;
   if(!ac || S.leaving || !$('#sfx').checked) return;
+  const peak = (SFX_LEVEL[name]||.6) * $('#sfxVol').value/100;
+  if(peak<=0) return;
+  const bus = sfxBus(ac);
   const now = performance.now();
   if(sfxLast[name] && now-sfxLast[name] < 150) return; // a burst of events plays once
   sfxLast[name] = now;
   const t0 = ac.currentTime + 0.01;
   SFX[name].forEach(([f, at, len])=>{
     const o = ac.createOscillator(), g = ac.createGain();
-    o.type = 'sine'; o.frequency.value = f;
+    o.type = 'triangle'; o.frequency.value = f; // triangle sounds fuller and louder than a plain sine
     g.gain.setValueAtTime(0, t0+at);
-    g.gain.linearRampToValueAtTime(0.14, t0+at+0.01);
-    g.gain.exponentialRampToValueAtTime(0.0001, t0+at+len);
-    o.connect(g); g.connect(ac.destination);
-    o.start(t0+at); o.stop(t0+at+len+0.02);
+    g.gain.linearRampToValueAtTime(peak, t0+at+0.008);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0+at+len+0.05);
+    o.connect(g); g.connect(bus);
+    o.start(t0+at); o.stop(t0+at+len+0.08);
   });
 }
 
@@ -1076,6 +1092,9 @@ try{ const sv = localStorage.getItem('voicedle-sens'); if(sv!==null) $('#sens').
 showSens();
 $('#sfx').onchange       = ()=>{ try{ localStorage.setItem('voicedle-sfx', $('#sfx').checked ? '1' : '0'); }catch{} };
 try{ if(localStorage.getItem('voicedle-sfx')==='0') $('#sfx').checked = false; }catch{}
+$('#sfxVol').oninput    = e=>{ $('#sfxPct').textContent = e.target.value+'%'; try{ localStorage.setItem('voicedle-sfxvol', e.target.value); }catch{} };
+$('#sfxVol').onchange   = ()=>sfx('join'); // play a sample when you let go
+try{ const v = localStorage.getItem('voicedle-sfxvol'); if(v!==null){ $('#sfxVol').value = v; $('#sfxPct').textContent = v+'%'; } }catch{}
 $('#vol').oninput       = e=>{ S.volume = e.target.value/100; $('#volPct').textContent = e.target.value+'%'; applyVolumes(); };
 $('#btnCopy').onclick   = async ()=>{
   const link = location.protocol.startsWith('http') ? location.origin+location.pathname+'#'+S.code : S.code;
