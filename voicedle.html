@@ -74,6 +74,11 @@ footer{display:flex;justify-content:center;gap:10px;padding:12px;border-top:1px 
 #settings label:first-child{margin-top:0}
 #settings select{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px}
 #settings input[type=range]{width:100%}
+.lvl{position:relative;height:8px;border-radius:4px;background:var(--bg);border:1px solid var(--line);overflow:hidden;margin-bottom:4px}
+.lvl-fill{position:absolute;left:0;top:0;bottom:0;width:0;background:var(--muted)}
+.lvl-fill.open{background:var(--live)}
+.lvl-mark{position:absolute;top:0;bottom:0;width:2px;background:#fff}
+.set-hint{font-size:12px;color:var(--muted);margin-top:2px}
 audio{display:none}
 .svol{position:absolute;left:10px;bottom:10px;display:flex;align-items:center;gap:8px;background:rgba(18,20,26,.85);border:1px solid var(--line);border-radius:8px;padding:5px 10px}
 .svol input{width:110px}
@@ -192,8 +197,12 @@ audio{display:none}
         <option value="1920x1080@60">1080p, 60 fps (games)</option>
         <option value="2560x1440@30">1440p, 30 fps</option>
       </select>
+      <label for="sens">Mic sensitivity <span class="pct" id="sensTxt"></span></label>
+      <div class="lvl" aria-hidden="true"><div class="lvl-fill" id="lvlFill"></div><div class="lvl-mark" id="lvlMark"></div></div>
+      <input type="range" id="sens" min="-100" max="0" step="1" value="-60">
+      <div class="set-hint">Your voice is sent only when it is louder than the white line. Slide fully left to always send.</div>
       <label for="vol">Volume of everyone (voices and shared screens) <span class="pct" id="volPct">100%</span></label>
-      <input type="range" id="vol" min="0" max="200" step="5" value="100">
+      <input type="range" id="vol" min="0" max="500" step="5" value="100">
     </div>
   </footer>
 </div>
@@ -205,11 +214,12 @@ audio{display:none}
 const $ = s => document.querySelector(s);
 const PREFIX = 'voicedle-';
 const S = {
-  peer:null, myId:null, local:null, name:'', code:'', hostId:'', isHost:false,
+  // mic = raw microphone stream, local = processed stream (after the sensitivity gate) sent to others
+  peer:null, myId:null, mic:null, micSrc:null, gate:null, local:null, name:'', code:'', hostId:'', isHost:false,
   peers:new Map(), screen:null, screenCalls:new Map(), cam:null, camCalls:new Map(),
   muted:false, deaf:false, wasMuted:false, volume:1,
   ac:null, meters:new Map(), meterTimer:null,
-  chat:[], chatIds:new Set(), msgEls:new Map(), unread:0, replyTo:null, pending:null, chatRaf:0
+  chat:[], chatIds:new Set(), msgEls:new Map(), unread:0, histPos:0, replyTo:null, pending:null, chatRaf:0
 };
 const CHAT_MAX = 500; // messages kept in history
 const FILE_MAX = 25*1024*1024; // largest file you can send in chat
@@ -230,7 +240,7 @@ function broadcast(msg){ S.peers.forEach(e=>{ if(e.conn&&e.conn.open) e.conn.sen
 function entry(id){
   let e = S.peers.get(id);
   if(!e){
-    // vol = this person's voice volume, svol = their shared screen volume (1 = 100%, up to 2 = 200%)
+    // vol = this person's voice volume, svol = their shared screen volume (1 = 100%, up to 5 = 500%)
     e = {id, name:'Guest', conn:null, voiceCall:null, screenCall:null, camCall:null, stream:null, screen:null, cam:null, muted:false, deaf:false, amp:null, vol:1, svol:1};
     S.peers.set(id,e);
   }
@@ -244,8 +254,12 @@ function makeAmp(stream){
   const raw = new Audio(); raw.muted = true; raw.srcObject = stream; raw.play().catch(()=>{});
   const src = S.ac.createMediaStreamSource(stream);
   const gain = S.ac.createGain();
+  // limiter after the boost, so loud parts are held down instead of crackling
+  const lim = S.ac.createDynamicsCompressor();
+  lim.threshold.value = -3; lim.knee.value = 3; lim.ratio.value = 20;
+  lim.attack.value = 0.002; lim.release.value = 0.15;
   const dest = S.ac.createMediaStreamDestination();
-  src.connect(gain); gain.connect(dest);
+  src.connect(gain); gain.connect(lim); lim.connect(dest);
   const el = document.createElement('audio');
   el.autoplay = true; el.srcObject = dest.stream; el.muted = S.deaf;
   $('#audios').appendChild(el);
@@ -254,7 +268,7 @@ function makeAmp(stream){
   return {
     el,
     set(v){ gain.gain.value = v; },
-    stop(){ try{ src.disconnect(); gain.disconnect(); }catch{} raw.srcObject = null; el.srcObject = null; el.remove(); }
+    stop(){ try{ src.disconnect(); gain.disconnect(); lim.disconnect(); }catch{} raw.srcObject = null; el.srcObject = null; el.remove(); }
   };
 }
 function applyVolumes(){
@@ -265,7 +279,7 @@ function applyVolumes(){
   });
 }
 function volSlider(value, label, onChange){
-  const rg = document.createElement('input'); rg.type='range'; rg.min=0; rg.max=200; rg.step=5;
+  const rg = document.createElement('input'); rg.type='range'; rg.min=0; rg.max=500; rg.step=5;
   rg.value = Math.round(value*100); rg.setAttribute('aria-label', label);
   rg.title = 'Double-click to reset to 100%';
   const pct = document.createElement('span'); pct.className='pct'; pct.textContent = rg.value+'%';
@@ -282,17 +296,84 @@ async function getMic(deviceId){
   });
 }
 
+/* ---------- mic sensitivity (noise gate) ---------- */
+// Runs on the audio thread, so it keeps working when the tab is in the background.
+// Opens when the mic is louder than the threshold, and stays open a moment after,
+// so the ends of words are not cut.
+const GATE_CODE = `
+class Gate extends AudioWorkletProcessor{
+  constructor(){
+    super(); this.th=-60; this.hold=0; this.g=0; this.n=0; this.peak=-100;
+    this.port.onmessage = e=>{ this.th = e.data; };
+  }
+  process(inputs, outputs){
+    const inp = inputs[0], out = outputs[0];
+    if(!inp || !inp.length) return true;
+    const len = inp[0].length;
+    let sum = 0;
+    for(const ch of inp) for(let i=0;i<len;i++) sum += ch[i]*ch[i];
+    const db = 20*Math.log10(Math.sqrt(sum/(len*inp.length)) + 1e-9);
+    if(this.th<=-100 || db>=this.th) this.hold = sampleRate*0.35;
+    else this.hold -= len;
+    const target = this.hold>0 ? 1 : 0;
+    const k = target>this.g ? 0.2 : 0.004; // open fast, close gently
+    for(let i=0;i<len;i++){
+      this.g += (target-this.g)*k;
+      for(let c=0;c<out.length;c++) out[c][i] = (inp[c]||inp[0])[i]*this.g;
+    }
+    // report the level to the page about 20 times a second, for the meter
+    this.peak = Math.max(this.peak, db); this.n += len;
+    if(this.n >= sampleRate/20){ this.port.postMessage({db:this.peak, open:target===1}); this.n = 0; this.peak = -100; }
+    return true;
+  }
+}
+registerProcessor('voicedle-gate', Gate);`;
+
+async function buildMicChain(raw){
+  try{
+    const url = URL.createObjectURL(new Blob([GATE_CODE], {type:'application/javascript'}));
+    await S.ac.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
+    S.gate = new AudioWorkletNode(S.ac, 'voicedle-gate');
+    S.gate.port.postMessage(sensValue());
+    S.gate.port.onmessage = e=>showLevel(e.data);
+    const dest = S.ac.createMediaStreamDestination();
+    S.gate.connect(dest);
+    S.micSrc = S.ac.createMediaStreamSource(raw);
+    S.micSrc.connect(S.gate);
+    return dest.stream;
+  }catch(e){
+    // browser without audio worklets: send the mic as it is
+    S.gate = null;
+    $('#sensTxt').textContent = '(not supported in this browser)';
+    return raw;
+  }
+}
+function sensValue(){ return +$('#sens').value; }
+function showSens(){
+  const v = sensValue();
+  $('#sensTxt').textContent = v<=-100 ? 'Always send' : v+' dB';
+  $('#lvlMark').style.left = (v+100)+'%';
+}
+function showLevel(d){
+  if($('#settings').classList.contains('hidden')) return;
+  const f = $('#lvlFill');
+  f.style.width = Math.max(0, Math.min(100, d.db+100))+'%';
+  f.classList.toggle('open', d.open);
+}
+
 async function start(create){
   setErr('');
   const name = $('#name').value.trim() || 'Guest'+Math.floor(100+Math.random()*900);
   let code = $('#code').value.trim().toUpperCase();
   if(!create && code.length<4){ setErr('Enter the room code you received.'); return; }
   if(typeof Peer==='undefined'){ setErr('Could not load the connection library. Check your internet connection and reload.'); return; }
-  try{ S.local = await getMic(); }
+  try{ S.mic = await getMic(); }
   catch(e){ setErr('Microphone access is needed. Allow it in the browser address bar and try again.'); return; }
   S.name = name;
   S.ac = new (window.AudioContext||window.webkitAudioContext)();
   S.ac.resume();
+  S.local = await buildMicChain(S.mic);
   S.isHost = create;
   if(create) code = genCode();
   S.code = code;
@@ -377,8 +458,8 @@ function onData(id,d){
   else if(d.t==='screen-stop'){ e.screen=null; if(e.screenCall){ try{e.screenCall.close();}catch{} e.screenCall=null; } }
   else if(d.t==='cam-stop'){ e.cam=null; if(e.camCall){ try{e.camCall.close();}catch{} e.camCall=null; } }
   // the author is whoever sent it to us directly, so nobody can post or delete as someone else
-  else if(d.t==='chat'){ if(d.m) addMsg(Object.assign({}, d.m, {fromId:id})); return; }
-  else if(d.t==='history'){ if(id===S.hostId && d.m) addMsg(d.m); return; }
+  else if(d.t==='chat'){ if(d.m) addMsg(Object.assign({}, d.m, {fromId:id, ts:Date.now()})); return; }
+  else if(d.t==='history'){ if(id===S.hostId && d.m) addMsg(d.m, true); return; }
   else if(d.t==='del'){ const m = S.chat.find(x=>x.id===d.id); if(m && m.fromId===id) removeMsg(d.id); return; }
   render();
 }
@@ -549,7 +630,7 @@ const INLINE = /^(image\/(png|jpeg|gif|webp|avif|bmp)|video\/(mp4|webm|ogg)|audi
 
 function fmtSize(n){ return n<1024 ? n+' B' : n<1048576 ? (n/1024).toFixed(0)+' KB' : (n/1048576).toFixed(1)+' MB'; }
 
-function addMsg(m){
+function addMsg(m, fromHistory){
   if(!m || typeof m.id!=='string' || S.chatIds.has(m.id)) return;
   const msg = {
     id: m.id.slice(0,80),
@@ -572,8 +653,9 @@ function addMsg(m){
   }
   if(!msg.text.trim() && !msg.file) return;
   S.chatIds.add(msg.id);
-  S.chat.push(msg);
-  S.chat.sort((a,b)=>a.ts-b.ts);
+  // keep arrival order: computer clocks differ, so sorting by their times mixes messages up
+  // history goes before anything that arrived live while it was still loading
+  if(fromHistory) S.chat.splice(S.histPos++, 0, msg); else S.chat.push(msg);
   while(S.chat.length>CHAT_MAX) dropMsg(S.chat[0]);
   if($('#chat').classList.contains('hidden') && msg.fromId!==S.myId) S.unread++;
   renderChat();
@@ -584,7 +666,9 @@ function wireMsg(m){
     file: m.file ? {name:m.file.name, type:m.file.type, size:m.file.size, data:m.file.data} : null};
 }
 function dropMsg(m){
-  S.chat.splice(S.chat.indexOf(m), 1);
+  const i = S.chat.indexOf(m);
+  S.chat.splice(i, 1);
+  if(i < S.histPos) S.histPos--;
   if(m.url) URL.revokeObjectURL(m.url);
   const el = S.msgEls.get(m.id); if(el) el.remove();
   S.msgEls.delete(m.id);
@@ -732,7 +816,7 @@ function drawChat(){
 }
 function clearChat(){
   S.chat.forEach(m=>{ if(m.url) URL.revokeObjectURL(m.url); });
-  S.chat = []; S.chatIds.clear(); S.msgEls.clear(); S.unread = 0;
+  S.chat = []; S.histPos = 0; S.chatIds.clear(); S.msgEls.clear(); S.unread = 0;
   $('#msgs').innerHTML = ''; $('#chatIn').value = '';
   setPending(null); setReply(null);
 }
@@ -854,7 +938,7 @@ async function loadDevices(){
   try{
     const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==='audioinput');
     const sel = $('#micSel'); sel.innerHTML='';
-    const cur = S.local.getAudioTracks()[0].getSettings().deviceId;
+    const cur = S.mic.getAudioTracks()[0].getSettings().deviceId;
     devs.forEach((d,i)=>{
       const o=document.createElement('option'); o.value=d.deviceId; o.textContent=d.label||('Microphone '+(i+1));
       if(d.deviceId===cur) o.selected=true; sel.appendChild(o);
@@ -864,6 +948,15 @@ async function loadDevices(){
 async function changeMic(){
   try{
     const ns = await getMic($('#micSel').value);
+    if(S.gate){
+      // the sent stream stays the same; only its input changes
+      try{ S.micSrc.disconnect(); }catch{}
+      S.micSrc = S.ac.createMediaStreamSource(ns);
+      S.micSrc.connect(S.gate);
+      S.mic.getTracks().forEach(t=>t.stop());
+      S.mic = ns;
+      return;
+    }
     const nt = ns.getAudioTracks()[0]; nt.enabled = !S.muted;
     S.peers.forEach(e=>{
       if(e.voiceCall && e.voiceCall.peerConnection){
@@ -872,7 +965,7 @@ async function changeMic(){
       }
     });
     S.local.getTracks().forEach(t=>t.stop());
-    S.local = ns; meter('me', ns);
+    S.local = S.mic = ns; meter('me', ns);
   }catch(e){ alert('Could not switch microphone.'); }
 }
 
@@ -883,9 +976,10 @@ function leave(msg){
   Array.from(S.peers.keys()).forEach(removePeer);
   try{ S.peer&&S.peer.destroy(); }catch{}
   if(S.local) S.local.getTracks().forEach(t=>t.stop());
+  if(S.mic) S.mic.getTracks().forEach(t=>t.stop());
   clearInterval(S.meterTimer); S.meters.clear();
   try{ S.ac&&S.ac.close(); }catch{}
-  S.peer=null; S.local=null; S.ac=null; S.muted=false; S.deaf=false;
+  S.peer=null; S.local=null; S.mic=null; S.micSrc=null; S.gate=null; S.ac=null; S.muted=false; S.deaf=false;
   $('#settings').classList.add('hidden');
   $('#room').classList.add('hidden');
   $('#join').classList.remove('hidden');
@@ -926,6 +1020,9 @@ document.addEventListener('keydown', e=>{
 $('#btnLeave').onclick  = ()=>leave();
 $('#btnSet').onclick    = ()=>$('#settings').classList.toggle('hidden');
 $('#micSel').onchange   = changeMic;
+$('#sens').oninput      = ()=>{ showSens(); if(S.gate) S.gate.port.postMessage(sensValue()); try{ localStorage.setItem('voicedle-sens', sensValue()); }catch{} };
+try{ const sv = localStorage.getItem('voicedle-sens'); if(sv!==null) $('#sens').value = sv; }catch{}
+showSens();
 $('#vol').oninput       = e=>{ S.volume = e.target.value/100; $('#volPct').textContent = e.target.value+'%'; applyVolumes(); };
 $('#btnCopy').onclick   = async ()=>{
   const link = location.protocol.startsWith('http') ? location.origin+location.pathname+'#'+S.code : S.code;
