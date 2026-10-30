@@ -104,6 +104,8 @@ footer{display:flex;justify-content:center;gap:10px;padding:12px;border-top:1px 
 .req .rn{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .req .rb{display:flex;gap:8px;margin-top:8px}
 .req .rb .btn{flex:1;padding:7px 10px}
+.req .auto{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin:8px 0 0;cursor:pointer}
+#roomCode{cursor:pointer}
 #waitBox{position:fixed;inset:0;background:rgba(10,12,16,.92);display:grid;place-items:center;z-index:15;padding:24px;text-align:center}
 #waitBox .join-card p{margin:10px 0 18px}
 #toast{position:fixed;left:50%;top:60px;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 14px;z-index:16;max-width:calc(100vw - 24px);box-shadow:0 8px 30px rgba(0,0,0,.5)}
@@ -171,7 +173,7 @@ audio{display:none}
     <label for="name">Your name</label>
     <input type="text" id="name" maxlength="24" placeholder="e.g. Ana" autocomplete="nickname">
     <label for="code">Room code (only to join an existing room)</label>
-    <input type="text" id="code" maxlength="6" placeholder="ABC123" autocomplete="off">
+    <input type="text" id="code" maxlength="80" placeholder="ABC123 or paste the room link" autocomplete="off">
     <div class="row">
       <button class="btn primary" id="btnCreate">Create room</button>
       <button class="btn" id="btnJoin">Join room</button>
@@ -185,8 +187,8 @@ audio{display:none}
 <div id="room" class="hidden">
   <header>
     <span class="title">Voicedle</span>
-    <span class="code" id="roomCode"></span>
-    <button class="btn" id="btnCopy">Copy code</button>
+    <span class="code" id="roomCode" title="Click to copy the room code" role="button" tabindex="0"></span>
+    <button class="btn" id="btnCopy" title="Copy a link that opens this room">Copy link</button>
     <span class="spacer"></span>
     <span id="status"></span>
   </header>
@@ -597,7 +599,7 @@ function showLevel(d){
 async function start(create){
   setErr('');
   const name = $('#name').value.trim() || 'Guest'+Math.floor(100+Math.random()*900);
-  let code = $('#code').value.trim().toUpperCase();
+  let code = cleanCode($('#code').value);
   if(!create && code.length<4){ setErr('Enter the room code you received.'); return; }
   if(typeof Peer==='undefined'){ setErr('Could not load the connection library. Check your internet connection and reload.'); return; }
   try{ S.mic = await getMic(); }
@@ -643,6 +645,7 @@ function enterRoom(){
   $('#join').classList.add('hidden');
   $('#room').classList.remove('hidden');
   $('#roomCode').textContent = S.code;
+  setHash(S.code); // the link in the address bar always matches the room code
   $('#lobbyRow').classList.toggle('hidden', !S.isHost);
   meter('me', S.local);
   startMeterLoop();
@@ -768,7 +771,15 @@ function renderLobby(){
     const b = document.createElement('div'); b.className='rb';
     const yes = document.createElement('button'); yes.className='btn primary'; yes.textContent='Let in'; yes.onclick = ()=>admitPeer(e);
     const no = document.createElement('button'); no.className='btn'; no.textContent='Deny'; no.onclick = ()=>denyPeer(e);
-    b.append(yes, no); r.append(n, b); box.appendChild(r);
+    // ticked + "Let in" = stop asking and let everyone in from now on (same as the Settings option)
+    const auto = document.createElement('label'); auto.className='auto';
+    const ck = document.createElement('input'); ck.type='checkbox';
+    auto.append(ck, 'Let people in automatically from now on');
+    yes.onclick = ()=>{
+      if(ck.checked){ $('#lobbyChk').checked = false; $('#lobbyChk').onchange(); toast('New people will join without asking. You can change this in Settings.'); }
+      else admitPeer(e);
+    };
+    b.append(yes, no); r.append(n, b, auto); box.appendChild(r);
   });
 }
 
@@ -1357,6 +1368,7 @@ function leave(msg){
   clearChat();
   toggleChat(false);
   S.leaving = false;
+  setHash('');
   S.admitted.clear(); S.smuted = false;
   $('#waitBox').classList.add('hidden'); $('#lobby').innerHTML = ''; $('#lobbyRow').classList.add('hidden');
   $('#hearMe').checked = false; // never start the next call hearing yourself
@@ -1415,14 +1427,39 @@ $('#lobbyChk').onchange = ()=>{
 };
 try{ if(localStorage.getItem('voicedle-lobby')==='0') $('#lobbyChk').checked = false; }catch{}
 $('#vol').oninput       = e=>{ S.volume = e.target.value/100; $('#volPct').textContent = e.target.value+'%'; applyVolumes(); };
-$('#btnCopy').onclick   = async ()=>{
-  const link = location.protocol.startsWith('http') ? location.origin+location.pathname+'#'+S.code : S.code;
-  try{ await navigator.clipboard.writeText(link); $('#btnCopy').textContent='Copied'; }
-  catch{ prompt('Copy this:', link); }
-  setTimeout(()=>$('#btnCopy').textContent='Copy code',1500);
-};
+function roomLink(){ return location.protocol.startsWith('http') ? location.origin+location.pathname+'#'+S.code : S.code; }
+async function copyText(text){
+  try{ await navigator.clipboard.writeText(text); toast('Copied: '+text); }
+  catch{ prompt('Copy this:', text); }
+}
+$('#btnCopy').onclick   = ()=>copyText(roomLink());
+$('#roomCode').onclick  = ()=>copyText(S.code);
+$('#roomCode').onkeydown = e=>{ if(e.key==='Enter' || e.key===' '){ e.preventDefault(); copyText(S.code); } };
 window.addEventListener('beforeunload',()=>{ try{S.peer&&S.peer.destroy();}catch{} });
-if(location.hash.length>1) $('#code').value = location.hash.slice(1).toUpperCase();
+/* ---------- room link ---------- */
+// "ABC123", "abc123" or "https://site/#ABC123" all give "ABC123"
+function cleanCode(v){
+  v = String(v||'').trim();
+  if(v.includes('#')) v = v.slice(v.lastIndexOf('#')+1);
+  return v.replace(/[^a-z0-9]/gi,'').toUpperCase().slice(0,6);
+}
+function setHash(code){
+  try{ history.replaceState(null, '', code ? '#'+code : location.pathname+location.search); }catch{}
+}
+// opening a room link fills in the code and makes "Join room" the main button
+function readHash(){
+  if(!$('#room').classList.contains('hidden')) return; // already in a room
+  const code = cleanCode(location.hash);
+  if(!code) return;
+  $('#code').value = code;
+  $('#btnJoin').classList.add('primary'); $('#btnCreate').classList.remove('primary');
+  setErr('');
+  $('#name').focus();
+}
+$('#code').addEventListener('input', e=>{ if(e.target.value.includes('#')) e.target.value = cleanCode(e.target.value); });
+$('#name').addEventListener('keydown', e=>{ if(e.key==='Enter') start(!cleanCode($('#code').value)); });
+window.addEventListener('hashchange', readHash);
+readHash();
 </script>
 </body>
 </html>
