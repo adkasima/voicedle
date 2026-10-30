@@ -242,6 +242,7 @@ audio{display:none}
         <option value="radio">Radio / walkie-talkie</option>
         <option value="deep">Deep voice</option>
         <option value="chipmunk">Chipmunk</option>
+        <option value="bass">Bass boosted (very loud, distorted)</option>
       </select>
       <label class="chk"><input type="checkbox" id="hearMe"> Hear my own voice (to test effects, use headphones)</label>
       <label for="vol">Volume of everyone (voices and shared screens) <span class="pct" id="volPct">100%</span></label>
@@ -408,7 +409,8 @@ function sfx(name){
 /* ---------- start / join ---------- */
 async function getMic(deviceId){
   return navigator.mediaDevices.getUserMedia({
-    audio:{ deviceId: deviceId?{exact:deviceId}:undefined, echoCancellation:true, noiseSuppression:true, autoGainControl:true },
+    audio:{ deviceId: deviceId?{exact:deviceId}:undefined, echoCancellation:true, noiseSuppression:true, autoGainControl:true,
+      sampleRate:{ideal:48000}, channelCount:{ideal:1}, voiceIsolation:true },
     video:false
   });
 }
@@ -431,7 +433,8 @@ class GateKernel{
     if(this.th<=-100 || db>=this.th) this.hold = this.sr*0.35;
     else this.hold -= len;
     const target = this.hold>0 ? 1 : 0;
-    const k = target>this.g ? 0.2 : 0.004; // open fast, close gently
+    // fade in over ~4 ms and out over ~80 ms, so opening and closing never click
+    const k = target>this.g ? 1-Math.exp(-1/(0.004*this.sr)) : 1-Math.exp(-1/(0.08*this.sr));
     for(let i=0;i<len;i++){
       this.g += (target-this.g)*k;
       for(let c=0;c<out.length;c++) out[c][i] = (inp[c]||inp[0])[i]*this.g;
@@ -444,7 +447,7 @@ class GateKernel{
 // Pitch shifter: two read heads sweep through a short delay line at a different
 // speed than it is written, and fade over each other to hide the jumps.
 class PitchKernel{
-  constructor(ratio){ this.ratio = ratio; this.N = 4096; this.buf = new Float32Array(this.N); this.w = 0; this.L = 2048; this.p = 0; }
+  constructor(ratio){ this.ratio = ratio; this.N = 4096; this.buf = new Float32Array(this.N); this.w = 0; this.L = 1536; this.p = 0; }
   read(d){
     let x = this.w - d; while(x<0) x += this.N;
     const i = Math.floor(x), f = x - i, j = (i+1) % this.N;
@@ -455,7 +458,8 @@ class PitchKernel{
     for(let i=0;i<a.length;i++){
       this.buf[this.w] = a[i];
       const p1 = this.p, p2 = (this.p+0.5) % 1;
-      const y = this.read(p1*this.L+1)*Math.sin(Math.PI*p1) + this.read(p2*this.L+1)*Math.sin(Math.PI*p2);
+      const w1 = Math.sin(Math.PI*p1), w2 = Math.sin(Math.PI*p2);
+      const y = this.read(p1*this.L+1)*w1*w1 + this.read(p2*this.L+1)*w2*w2; // w1² + w2² = 1
       for(let c=0;c<out.length;c++) out[c][i] = y;
       this.w = (this.w+1) % this.N;
       this.p = ((this.p+dp) % 1 + 1) % 1;
@@ -545,15 +549,17 @@ const EFFECTS = {
   none(ac, inp, out){ inp.connect(out); return []; },
   reverb(ac, inp, out){
     const dry = ac.createGain(), wet = ac.createGain(), conv = ac.createConvolver();
-    dry.gain.value = 0.8; wet.gain.value = 1.2; conv.buffer = reverbImpulse(ac, 2.8, 2.5);
-    inp.connect(dry); dry.connect(out); inp.connect(conv); conv.connect(wet); wet.connect(out);
-    return [dry, wet, conv];
+    const damp = ac.createBiquadFilter(); damp.type = 'lowpass'; damp.frequency.value = 5000;
+    dry.gain.value = 0.85; wet.gain.value = 1.1; conv.buffer = reverbImpulse(ac, 2.4, 3);
+    inp.connect(dry); dry.connect(out); inp.connect(conv); conv.connect(damp); damp.connect(wet); wet.connect(out);
+    return [dry, wet, conv, damp];
   },
   echo(ac, inp, out){
     const d = ac.createDelay(1), fb = ac.createGain(), wet = ac.createGain();
-    d.delayTime.value = 0.32; fb.gain.value = 0.45; wet.gain.value = 0.7;
-    inp.connect(out); inp.connect(d); d.connect(fb); fb.connect(d); d.connect(wet); wet.connect(out);
-    return [d, fb, wet];
+    const damp = ac.createBiquadFilter(); damp.type = 'lowpass'; damp.frequency.value = 3500; // each repeat a bit darker
+    d.delayTime.value = 0.32; fb.gain.value = 0.42; wet.gain.value = 0.6;
+    inp.connect(out); inp.connect(d); d.connect(damp); damp.connect(fb); fb.connect(d); damp.connect(wet); wet.connect(out);
+    return [d, fb, wet, damp];
   },
   robot(ac, inp, out){
     // short metallic comb, then ring modulation (voice multiplied by a 50 Hz tone)
@@ -574,7 +580,20 @@ const EFFECTS = {
     return [hp, lp, sh, g];
   },
   deep(ac, inp, out){ const p = makePitch(ac, 0.7); inp.connect(p); p.connect(out); return [p]; },
-  chipmunk(ac, inp, out){ const p = makePitch(ac, 1.6); inp.connect(p); p.connect(out); return [p]; }
+  chipmunk(ac, inp, out){ const p = makePitch(ac, 1.6); inp.connect(p); p.connect(out); return [p]; },
+  bass(ac, inp, out){
+    // huge low boost, driven hard into clipping, on purpose
+    const pre = ac.createGain(), low = ac.createBiquadFilter(), sub = ac.createBiquadFilter(), sh = ac.createWaveShaper(), post = ac.createGain();
+    pre.gain.value = 6;
+    low.type = 'lowshelf'; low.frequency.value = 180; low.gain.value = 22;
+    sub.type = 'peaking'; sub.frequency.value = 70; sub.Q.value = 1; sub.gain.value = 12;
+    const curve = new Float32Array(2048);
+    for(let i=0;i<2048;i++){ const x = i/1023.5-1; curve[i] = Math.tanh(x*12); }
+    sh.curve = curve; sh.oversample = '2x';
+    post.gain.value = 0.85; // clipped signal never goes past this, so it stays loud but not dangerous
+    inp.connect(pre); pre.connect(low); low.connect(sub); sub.connect(sh); sh.connect(post); post.connect(out);
+    return [pre, low, sub, sh, post];
+  }
 };
 function setEffect(name){
   if(!S.fxIn) return;
@@ -605,10 +624,12 @@ async function start(create){
   try{ S.mic = await getMic(); }
   catch(e){ setErr('Microphone access is needed. Allow it in the browser address bar and try again.'); return; }
   S.name = name;
-  S.ac = new (window.AudioContext||window.webkitAudioContext)();
+  const AC = window.AudioContext||window.webkitAudioContext;
+  try{ S.ac = new AC({latencyHint:'interactive', sampleRate:48000}); }catch{ S.ac = new AC(); } // some older browsers reject options
   S.ac.resume();
   S.local = await buildMicChain(S.mic);
   S.isHost = create;
+  if(create) $('#lobbyChk').checked = true; // every new room starts asking before people join
   if(create) code = genCode();
   S.code = code;
   S.hostId = PREFIX+code.toLowerCase();
@@ -657,6 +678,29 @@ function enterRoom(){
   sfx('join');
 }
 
+/* ---------- voice quality ---------- */
+// Asks both browsers for high-bitrate Opus with packet-loss protection on voice calls.
+function voiceSdp(sdp){
+  return sdp.replace(/a=fmtp:(\d+) ([^\r\n]*)/g, (line, pt, params)=>{
+    if(!/useinbandfec/.test(params)) return line; // only the Opus line
+    const keep = params.split(';').filter(p=>!/^(maxaveragebitrate|useinbandfec|usedtx|stereo|sprop-stereo|maxplaybackrate)=/.test(p.trim()));
+    return 'a=fmtp:'+pt+' '+keep.concat(['useinbandfec=1','usedtx=0','maxaveragebitrate=96000','maxplaybackrate=48000']).join(';');
+  });
+}
+function voiceBitrate(call){
+  setTimeout(()=>{
+    try{
+      call.peerConnection.getSenders().forEach(snd=>{
+        if(snd.track && snd.track.kind==='audio'){
+          const p = snd.getParameters(); if(!p.encodings || !p.encodings.length) p.encodings = [{}];
+          p.encodings[0].maxBitrate = 96000; p.encodings[0].priority = 'high'; p.encodings[0].networkPriority = 'high';
+          snd.setParameters(p).catch(()=>{});
+        }
+      });
+    }catch{}
+  }, 800);
+}
+
 /* ---------- connections ---------- */
 function connectTo(id){
   if(id===S.myId) return;
@@ -666,7 +710,8 @@ function connectTo(id){
   entry(id).ok = true;
   const c = S.peer.connect(id,{reliable:true});
   setupConn(c);
-  const call = S.peer.call(id, S.local, {metadata:{type:'voice'}});
+  const call = S.peer.call(id, S.local, {metadata:{type:'voice'}, sdpTransform:voiceSdp});
+  voiceBitrate(call);
   attachCall(id, call, 'voice');
 }
 
@@ -821,7 +866,8 @@ function onCall(call){
 }
 function acceptCall(call){
   const type = call.metadata && call.metadata.type;
-  if(type==='screen' || type==='cam') call.answer(); else call.answer(S.local);
+  if(type==='screen' || type==='cam') call.answer();
+  else { call.answer(S.local, {sdpTransform:voiceSdp}); voiceBitrate(call); }
   attachCall(call.peer, call, type==='screen'||type==='cam' ? type : 'voice');
 }
 
@@ -1421,11 +1467,9 @@ $('#hearMe').onchange   = ()=>{ if(S.monitor) S.monitor.gain.value = $('#hearMe'
 try{ const fx = localStorage.getItem('voicedle-fx'); if(fx && EFFECTS[fx]) $('#fxSel').value = fx; }catch{}
 $('#waitLeave').onclick = ()=>leave();
 $('#lobbyChk').onchange = ()=>{
-  try{ localStorage.setItem('voicedle-lobby', $('#lobbyChk').checked ? '1' : '0'); }catch{}
   // turning it off lets in everyone who is waiting
   if(!$('#lobbyChk').checked) S.peers.forEach(e=>{ if(e.waiting) admitPeer(e); });
 };
-try{ if(localStorage.getItem('voicedle-lobby')==='0') $('#lobbyChk').checked = false; }catch{}
 $('#vol').oninput       = e=>{ S.volume = e.target.value/100; $('#volPct').textContent = e.target.value+'%'; applyVolumes(); };
 function roomLink(){ return location.protocol.startsWith('http') ? location.origin+location.pathname+'#'+S.code : S.code; }
 async function copyText(text){
