@@ -360,24 +360,22 @@ async function getMic(deviceId){
   });
 }
 
-/* ---------- mic sensitivity (noise gate) ---------- */
-// Runs on the audio thread, so it keeps working when the tab is in the background.
-// Opens when the mic is louder than the threshold, and stays open a moment after,
-// so the ends of words are not cut.
-const GATE_CODE = `
-class Gate extends AudioWorkletProcessor{
-  constructor(){
-    super(); this.th=-60; this.hold=0; this.g=0; this.n=0; this.peak=-100;
-    this.port.onmessage = e=>{ this.th = e.data; };
-  }
-  process(inputs, outputs){
-    const inp = inputs[0], out = outputs[0];
-    if(!inp || !inp.length) return true;
+/* ---------- mic sensitivity (noise gate) and pitch shifter ---------- */
+// The sound processing lives in two small "kernels". They run in an AudioWorklet
+// (the audio thread) when the browser allows it. Otherwise they run in a
+// ScriptProcessor, an older API that works everywhere, including pages opened
+// straight from a file.
+
+// Noise gate: opens when the mic is louder than the threshold, and stays open a
+// moment after, so the ends of words are not cut.
+class GateKernel{
+  constructor(sr){ this.sr = sr; this.th = -60; this.hold = 0; this.g = 0; this.n = 0; this.peak = -100; this.onLevel = null; }
+  process(inp, out){
     const len = inp[0].length;
     let sum = 0;
     for(const ch of inp) for(let i=0;i<len;i++) sum += ch[i]*ch[i];
     const db = 20*Math.log10(Math.sqrt(sum/(len*inp.length)) + 1e-9);
-    if(this.th<=-100 || db>=this.th) this.hold = sampleRate*0.35;
+    if(this.th<=-100 || db>=this.th) this.hold = this.sr*0.35;
     else this.hold -= len;
     const target = this.hold>0 ? 1 : 0;
     const k = target>this.g ? 0.2 : 0.004; // open fast, close gently
@@ -385,31 +383,21 @@ class Gate extends AudioWorkletProcessor{
       this.g += (target-this.g)*k;
       for(let c=0;c<out.length;c++) out[c][i] = (inp[c]||inp[0])[i]*this.g;
     }
-    // report the level to the page about 20 times a second, for the meter
+    // report the level about 20 times a second, for the meter
     this.peak = Math.max(this.peak, db); this.n += len;
-    if(this.n >= sampleRate/20){ this.port.postMessage({db:this.peak, open:target===1}); this.n = 0; this.peak = -100; }
-    return true;
+    if(this.n >= this.sr/20){ if(this.onLevel) this.onLevel({db:this.peak, open:target===1}); this.n = 0; this.peak = -100; }
   }
 }
-registerProcessor('voicedle-gate', Gate);
-
-// Pitch shifter: two read heads sweep through a short delay line at a different speed
-// than it is written, and fade over each other to hide the jumps.
-class Pitch extends AudioWorkletProcessor{
-  constructor(o){
-    super();
-    this.ratio = (o.processorOptions && o.processorOptions.ratio) || 1;
-    this.N = 4096; this.buf = new Float32Array(this.N); this.w = 0;
-    this.L = 2048; this.p = 0;
-  }
+// Pitch shifter: two read heads sweep through a short delay line at a different
+// speed than it is written, and fade over each other to hide the jumps.
+class PitchKernel{
+  constructor(ratio){ this.ratio = ratio; this.N = 4096; this.buf = new Float32Array(this.N); this.w = 0; this.L = 2048; this.p = 0; }
   read(d){
     let x = this.w - d; while(x<0) x += this.N;
     const i = Math.floor(x), f = x - i, j = (i+1) % this.N;
     return this.buf[i]*(1-f) + this.buf[j]*f;
   }
-  process(inputs, outputs){
-    const inp = inputs[0], out = outputs[0];
-    if(!inp || !inp.length) return true;
+  process(inp, out){
     const a = inp[0], dp = (1-this.ratio)/this.L;
     for(let i=0;i<a.length;i++){
       this.buf[this.w] = a[i];
@@ -419,19 +407,61 @@ class Pitch extends AudioWorkletProcessor{
       this.w = (this.w+1) % this.N;
       this.p = ((this.p+dp) % 1 + 1) % 1;
     }
-    return true;
   }
 }
-registerProcessor('voicedle-pitch', Pitch);`;
+// the worklet module reuses the same kernel code
+const WORKLET_CODE = GateKernel.toString()+'\n'+PitchKernel.toString()+`
+class GateP extends AudioWorkletProcessor{
+  constructor(){ super(); this.k = new GateKernel(sampleRate); this.k.onLevel = d=>this.port.postMessage(d); this.port.onmessage = e=>{ this.k.th = e.data; }; }
+  process(i, o){ if(i[0] && i[0].length) this.k.process(i[0], o[0]); return true; }
+}
+registerProcessor('voicedle-gate', GateP);
+class PitchP extends AudioWorkletProcessor{
+  constructor(o){ super(); this.k = new PitchKernel((o.processorOptions && o.processorOptions.ratio) || 1); }
+  process(i, o){ if(i[0] && i[0].length) this.k.process(i[0], o[0]); return true; }
+}
+registerProcessor('voicedle-pitch', PitchP);`;
+
+// Pages opened from a file (file://) cannot load a worklet from a blob: URL,
+// but can from a data: URL, so try both.
+async function loadWorklet(ac){
+  if(!ac.audioWorklet || typeof AudioWorkletNode==='undefined') return false;
+  const urls = [
+    ()=>URL.createObjectURL(new Blob([WORKLET_CODE], {type:'application/javascript'})),
+    ()=>'data:application/javascript;charset=utf-8,'+encodeURIComponent(WORKLET_CODE)
+  ];
+  for(const make of urls){
+    try{ await ac.audioWorklet.addModule(make()); return true; }
+    catch(e){ console.warn('Audio worklet did not load, trying another way:', e); }
+  }
+  return false;
+}
+// runs a kernel in a ScriptProcessor (mono)
+function scriptNode(ac, kernel){
+  const sp = ac.createScriptProcessor(1024, 1, 1);
+  sp.onaudioprocess = e=>kernel.process([e.inputBuffer.getChannelData(0)], [e.outputBuffer.getChannelData(0)]);
+  // a ScriptProcessor only runs while it is connected towards the speakers; this path is silent
+  const z = ac.createGain(); z.gain.value = 0; sp.connect(z); z.connect(ac.destination);
+  return sp;
+}
+function makePitch(ac, ratio){
+  return S.worklet ? new AudioWorkletNode(ac, 'voicedle-pitch', {processorOptions:{ratio}}) : scriptNode(ac, new PitchKernel(ratio));
+}
 
 async function buildMicChain(raw){
   try{
-    const url = URL.createObjectURL(new Blob([GATE_CODE], {type:'application/javascript'}));
-    await S.ac.audioWorklet.addModule(url);
-    URL.revokeObjectURL(url);
-    S.gate = new AudioWorkletNode(S.ac, 'voicedle-gate');
-    S.gate.port.postMessage(sensValue());
-    S.gate.port.onmessage = e=>showLevel(e.data);
+    S.worklet = await loadWorklet(S.ac);
+    if(S.worklet){
+      S.gate = new AudioWorkletNode(S.ac, 'voicedle-gate');
+      S.gate.port.onmessage = e=>showLevel(e.data);
+      S.setTh = v=>S.gate.port.postMessage(v);
+    }else{
+      const k = new GateKernel(S.ac.sampleRate);
+      k.onLevel = showLevel;
+      S.gate = scriptNode(S.ac, k);
+      S.setTh = v=>{ k.th = v; };
+    }
+    S.setTh(sensValue());
     const dest = S.ac.createMediaStreamDestination();
     S.fxIn = S.ac.createGain(); S.fxOut = S.ac.createGain();
     S.monitor = S.ac.createGain(); S.monitor.gain.value = $('#hearMe').checked ? 1 : 0;
@@ -443,8 +473,9 @@ async function buildMicChain(raw){
     S.micSrc.connect(S.gate);
     return dest.stream;
   }catch(e){
-    // browser without audio worklets: send the mic as it is
-    S.gate = null;
+    // last resort: send the mic as it is
+    console.warn('Mic processing failed, sending the mic without effects:', e);
+    S.gate = null; S.setTh = null;
     $('#sensTxt').textContent = '(not supported in this browser)';
     $('#fxTxt').textContent = '(not supported in this browser)'; $('#fxSel').disabled = true;
     return raw;
@@ -489,13 +520,13 @@ const EFFECTS = {
     inp.connect(hp); hp.connect(lp); lp.connect(sh); sh.connect(g); g.connect(out);
     return [hp, lp, sh, g];
   },
-  deep(ac, inp, out){ const p = new AudioWorkletNode(ac, 'voicedle-pitch', {processorOptions:{ratio:0.7}}); inp.connect(p); p.connect(out); return [p]; },
-  chipmunk(ac, inp, out){ const p = new AudioWorkletNode(ac, 'voicedle-pitch', {processorOptions:{ratio:1.6}}); inp.connect(p); p.connect(out); return [p]; }
+  deep(ac, inp, out){ const p = makePitch(ac, 0.7); inp.connect(p); p.connect(out); return [p]; },
+  chipmunk(ac, inp, out){ const p = makePitch(ac, 1.6); inp.connect(p); p.connect(out); return [p]; }
 };
 function setEffect(name){
   if(!S.fxIn) return;
   try{ S.fxIn.disconnect(); }catch{}
-  (S.fxNodes||[]).forEach(n=>{ try{ n.stop && n.stop(); }catch{} try{ n.disconnect(); }catch{} });
+  (S.fxNodes||[]).forEach(n=>{ try{ n.stop && n.stop(); }catch{} n.onaudioprocess = null; try{ n.disconnect(); }catch{} });
   S.fxNodes = (EFFECTS[name] || EFFECTS.none)(S.ac, S.fxIn, S.fxOut);
 }
 
@@ -1142,7 +1173,7 @@ function leave(msg){
   clearInterval(S.meterTimer); S.meters.clear();
   // close the audio a moment later, so the leave sound can finish
   const ac = S.ac; if(ac) setTimeout(()=>{ try{ ac.close(); }catch{} }, 500);
-  S.peer=null; S.local=null; S.mic=null; S.micSrc=null; S.gate=null; S.fxIn=null; S.fxOut=null; S.fxNodes=null; S.monitor=null; S.ac=null; S.muted=false; S.deaf=false;
+  S.peer=null; S.local=null; S.mic=null; S.micSrc=null; S.gate=null; S.setTh=null; S.fxIn=null; S.fxOut=null; S.fxNodes=null; S.monitor=null; S.ac=null; S.muted=false; S.deaf=false;
   $('#settings').classList.add('hidden');
   $('#room').classList.add('hidden');
   $('#join').classList.remove('hidden');
@@ -1185,7 +1216,7 @@ document.addEventListener('keydown', e=>{
 $('#btnLeave').onclick  = ()=>leave();
 $('#btnSet').onclick    = ()=>$('#settings').classList.toggle('hidden');
 $('#micSel').onchange   = changeMic;
-$('#sens').oninput      = ()=>{ showSens(); if(S.gate) S.gate.port.postMessage(sensValue()); try{ localStorage.setItem('voicedle-sens', sensValue()); }catch{} };
+$('#sens').oninput      = ()=>{ showSens(); if(S.setTh) S.setTh(sensValue()); try{ localStorage.setItem('voicedle-sens', sensValue()); }catch{} };
 try{ const sv = localStorage.getItem('voicedle-sens'); if(sv!==null) $('#sens').value = sv; }catch{}
 showSens();
 $('#sfx').onchange       = ()=>{ try{ localStorage.setItem('voicedle-sfx', $('#sfx').checked ? '1' : '0'); }catch{} };
