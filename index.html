@@ -95,8 +95,33 @@ audio{display:none}
 .msg .when{font-size:11px;color:var(--muted);margin-left:6px;font-weight:400}
 .msg .txt{white-space:pre-wrap;overflow-wrap:anywhere}
 #msgs .empty{color:var(--muted);font-size:13px;text-align:center;margin:auto 0}
+.msg{position:relative;border-radius:8px;padding:4px 6px;margin:0 -6px}
+.msg:hover{background:var(--panel2)}
+.msg.flash{background:#2e3550}
+.msg .acts{position:absolute;right:4px;top:2px;display:none;gap:2px}
+.msg:hover .acts,.msg:focus-within .acts{display:flex}
+@media (hover:none){.msg .acts{display:flex;opacity:.7}}
+.msg .acts button{background:var(--panel);border:1px solid var(--line);border-radius:6px;font-size:12px;padding:1px 6px;color:var(--muted)}
+.msg .acts button:hover{color:var(--text)}
+.msg .quote{font-size:12px;color:var(--muted);border-left:3px solid var(--line);padding:1px 0 1px 8px;margin:2px 0 4px;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.msg .txt a{color:var(--accent)}
+.msg .att{margin-top:6px}
+.msg .att img,.msg .att video{display:block;max-width:100%;max-height:240px;border-radius:8px;border:1px solid var(--line);background:#000}
+.msg .att img{cursor:zoom-in}
+.msg .att audio{width:100%}
+.file{display:flex;align-items:center;gap:10px;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px 10px;color:var(--text);text-decoration:none}
+.file:hover{border-color:var(--accent)}
+.file .fn{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.file .fs2{font-size:12px;color:var(--muted)}
+.bar{display:flex;align-items:center;gap:8px;margin:0 10px;padding:6px 10px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;font-size:13px;color:var(--muted)}
+.bar span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar button{background:none;border:none;color:var(--muted);padding:0 4px}
 #chatForm{display:flex;gap:8px;padding:10px;border-top:1px solid var(--line)}
 #chatIn{flex:1;min-width:0;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:9px 11px}
+#btnAttach{padding:9px 11px}
+#chat.drop{outline:2px dashed var(--accent);outline-offset:-6px}
+#viewer{position:fixed;inset:0;background:rgba(0,0,0,.85);display:grid;place-items:center;z-index:20;cursor:zoom-out}
+#viewer img{max-width:95vw;max-height:95vh}
 .unread{background:var(--danger);color:#fff;border-radius:999px;font-size:11px;font-weight:700;padding:0 6px;min-width:18px;text-align:center}
 @media (max-width:760px){#body{position:relative}#chat{position:absolute;inset:0;width:auto;z-index:4;border-left:none}}
 </style>
@@ -137,10 +162,14 @@ audio{display:none}
     </div>
     <aside id="chat" class="hidden" aria-label="Chat">
       <div class="chat-head">Chat <button id="chatClose" aria-label="Close chat">✕</button></div>
-      <div class="chat-note">Only people in this room can see messages. People who join later see the history.</div>
+      <div class="chat-note">Only people in this room can see messages and files. People who join later see the history. Everything is deleted when everyone leaves.</div>
       <div id="msgs" aria-live="polite"></div>
+      <div class="bar hidden" id="replyBar"><span id="replyTxt"></span><button type="button" id="replyX" aria-label="Cancel reply">✕</button></div>
+      <div class="bar hidden" id="pendBar" style="margin-top:6px"><span id="pendTxt"></span><button type="button" id="pendX" aria-label="Remove file">✕</button></div>
       <form id="chatForm" autocomplete="off">
-        <input type="text" id="chatIn" maxlength="1000" placeholder="Message the room" aria-label="Message">
+        <button class="btn" type="button" id="btnAttach" aria-label="Attach a file" title="Attach a file (or paste / drop it here)">📎</button>
+        <input type="file" id="fileIn" class="hidden">
+        <input type="text" id="chatIn" maxlength="2000" placeholder="Message the room" aria-label="Message">
         <button class="btn primary" type="submit">Send</button>
       </form>
     </aside>
@@ -169,6 +198,7 @@ audio{display:none}
   </footer>
 </div>
 <div id="audios"></div>
+<div id="viewer" class="hidden"><img alt="Full size image"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <script>
@@ -179,9 +209,10 @@ const S = {
   peers:new Map(), screen:null, screenCalls:new Map(), cam:null, camCalls:new Map(),
   muted:false, deaf:false, wasMuted:false, volume:1,
   ac:null, meters:new Map(), meterTimer:null,
-  chat:[], chatIds:new Set(), unread:0
+  chat:[], chatIds:new Set(), msgEls:new Map(), unread:0, replyTo:null, pending:null, chatRaf:0
 };
 const CHAT_MAX = 500; // messages kept in history
+const FILE_MAX = 25*1024*1024; // largest file you can send in chat
 
 /* ---------- helpers ---------- */
 function genCode(){
@@ -325,8 +356,9 @@ function setupConn(c){
     if(S.isHost){
       c.send({t:'peers', list:[...S.peers.values()].filter(x=>x.id!==c.peer && x.conn && x.conn.open).map(x=>x.id)});
     }
-    // everyone in the room sends their chat history, so newcomers see past messages
-    if(S.chat.length) c.send({t:'history', list:S.chat});
+    // the host sends the chat history (with files), so newcomers see past messages.
+    // Only the host sends it, so big files are not sent several times.
+    if(S.isHost) S.chat.forEach(m=>c.send({t:'history', m:wireMsg(m)}));
     if(S.screen) shareTo(c.peer, 'screen');
     if(S.cam) shareTo(c.peer, 'cam');
     setStatus(S.peers.size+1+' in room');
@@ -344,13 +376,10 @@ function onData(id,d){
   else if(d.t==='peers'){ d.list.forEach(pid=>{ if(pid!==S.myId) connectTo(pid); }); }
   else if(d.t==='screen-stop'){ e.screen=null; if(e.screenCall){ try{e.screenCall.close();}catch{} e.screenCall=null; } }
   else if(d.t==='cam-stop'){ e.cam=null; if(e.camCall){ try{e.camCall.close();}catch{} e.camCall=null; } }
-  else if(d.t==='chat'){
-    // pass new messages on, so people not directly connected to the sender still get them
-    const m = addMsg(d.m);
-    if(m) S.peers.forEach((p,pid)=>{ if(pid!==id && p.conn && p.conn.open) p.conn.send({t:'chat', m}); });
-    return;
-  }
-  else if(d.t==='history'){ if(Array.isArray(d.list)) { d.list.slice(-CHAT_MAX).forEach(m=>addMsg(m,true)); renderChat(); } return; }
+  // the author is whoever sent it to us directly, so nobody can post or delete as someone else
+  else if(d.t==='chat'){ if(d.m) addMsg(Object.assign({}, d.m, {fromId:id})); return; }
+  else if(d.t==='history'){ if(id===S.hostId && d.m) addMsg(d.m); return; }
+  else if(d.t==='del'){ const m = S.chat.find(x=>x.id===d.id); if(m && m.fromId===id) removeMsg(d.id); return; }
   render();
 }
 
@@ -373,13 +402,14 @@ function attachCall(id, call, type){
       meter(id, s);
     });
   }else if(type==='cam'){
+    // ignore events from an older call, so a late "close" cannot remove a newer camera
     e.camCall = call;
-    call.on('stream', s=>{ if(e.cam!==s){ e.cam=s; render(); } });
-    call.on('close', ()=>{ e.cam=null; render(); });
+    call.on('stream', s=>{ if(e.camCall===call && e.cam!==s){ e.cam=s; render(); } });
+    call.on('close', ()=>{ if(e.camCall===call){ e.cam=null; e.camCall=null; render(); } });
   }else{
     e.screenCall = call;
-    call.on('stream', s=>{ if(e.screen!==s){ e.screen=s; s.addEventListener('addtrack', render); render(); } });
-    call.on('close', ()=>{ e.screen=null; render(); });
+    call.on('stream', s=>{ if(e.screenCall===call && e.screen!==s){ e.screen=s; s.addEventListener('addtrack', render); render(); } });
+    call.on('close', ()=>{ if(e.screenCall===call){ e.screen=null; e.screenCall=null; render(); } });
   }
 }
 
@@ -508,64 +538,210 @@ function stopCam(){
 }
 
 /* ---------- chat ---------- */
-// Messages travel only between people in the room (peer to peer). Each person keeps
-// the history and sends it to whoever joins, so later members see earlier messages.
-function addMsg(m, quiet){
-  if(!m || typeof m.id!=='string' || typeof m.text!=='string' || S.chatIds.has(m.id)) return null;
+// Messages and files travel only between people in the room (peer to peer), nothing is
+// stored on a server. The host sends the history to whoever joins. When everyone has
+// left, no copy remains anywhere.
+
+// Files from other people are only shown inline when they are a plain image, video or
+// audio type. Anything else is stored as a generic download, so a shared HTML or SVG
+// file can never run inside this page.
+const INLINE = /^(image\/(png|jpeg|gif|webp|avif|bmp)|video\/(mp4|webm|ogg)|audio\/(mpeg|mp3|ogg|wav|x-wav|webm|mp4|aac|flac|x-m4a))$/;
+
+function fmtSize(n){ return n<1024 ? n+' B' : n<1048576 ? (n/1024).toFixed(0)+' KB' : (n/1048576).toFixed(1)+' MB'; }
+
+function addMsg(m){
+  if(!m || typeof m.id!=='string' || S.chatIds.has(m.id)) return;
   const msg = {
     id: m.id.slice(0,80),
+    fromId: String(m.fromId||''),
     from: String(m.from||'Guest').slice(0,24),
-    text: m.text.slice(0,1000),
+    text: typeof m.text==='string' ? m.text.slice(0,2000) : '',
     ts: Number.isFinite(m.ts) ? m.ts : Date.now(),
-    mine: false
+    replyTo: typeof m.replyTo==='string' ? m.replyTo.slice(0,80) : null,
+    file: null, url: null
   };
-  if(!msg.text.trim()) return null;
+  const f = m.file;
+  if(f && f.data){
+    const data = f.data instanceof ArrayBuffer ? f.data
+      : ArrayBuffer.isView(f.data) ? f.data.buffer.slice(f.data.byteOffset, f.data.byteOffset+f.data.byteLength) : null;
+    if(data && data.byteLength<=FILE_MAX){
+      const type = typeof f.type==='string' ? f.type.toLowerCase().slice(0,100) : '';
+      msg.file = {name:String(f.name||'file').slice(0,120), type, size:data.byteLength, data};
+      msg.url = URL.createObjectURL(new Blob([data], {type: INLINE.test(type) ? type : 'application/octet-stream'}));
+    }
+  }
+  if(!msg.text.trim() && !msg.file) return;
   S.chatIds.add(msg.id);
   S.chat.push(msg);
   S.chat.sort((a,b)=>a.ts-b.ts);
-  while(S.chat.length>CHAT_MAX) S.chatIds.delete(S.chat.shift().id);
-  if($('#chat').classList.contains('hidden')) S.unread++;
-  if(!quiet) renderChat();
-  return {id:msg.id, from:msg.from, text:msg.text, ts:msg.ts};
-}
-function sendChat(text){
-  text = text.trim().slice(0,1000);
-  if(!text) return;
-  const m = {id:S.myId+'-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,8), from:S.name, text, ts:Date.now()};
-  addMsg(m);
-  S.chat.find(x=>x.id===m.id).mine = true;
-  broadcast({t:'chat', m});
+  while(S.chat.length>CHAT_MAX) dropMsg(S.chat[0]);
+  if($('#chat').classList.contains('hidden') && msg.fromId!==S.myId) S.unread++;
   renderChat();
 }
-function renderChat(){
-  const box = $('#msgs');
-  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
-  box.innerHTML = '';
-  if(!S.chat.length){
-    const em = document.createElement('div'); em.className='empty'; em.textContent='No messages yet. Say hi!';
-    box.appendChild(em);
+// what goes over the network (no local-only fields)
+function wireMsg(m){
+  return {id:m.id, fromId:m.fromId, from:m.from, text:m.text, ts:m.ts, replyTo:m.replyTo,
+    file: m.file ? {name:m.file.name, type:m.file.type, size:m.file.size, data:m.file.data} : null};
+}
+function dropMsg(m){
+  S.chat.splice(S.chat.indexOf(m), 1);
+  if(m.url) URL.revokeObjectURL(m.url);
+  const el = S.msgEls.get(m.id); if(el) el.remove();
+  S.msgEls.delete(m.id);
+  // the id stays in chatIds, so a deleted message never comes back
+}
+function removeMsg(id){
+  const m = S.chat.find(x=>x.id===id);
+  if(!m) return;
+  dropMsg(m);
+  if(S.replyTo===id) setReply(null);
+  renderChat();
+}
+function deleteMsg(id){
+  const m = S.chat.find(x=>x.id===id);
+  if(!m || m.fromId!==S.myId) return;
+  if(!confirm('Delete this message for everyone?')) return;
+  removeMsg(id);
+  broadcast({t:'del', id});
+}
+
+async function sendChat(){
+  const text = $('#chatIn').value.trim().slice(0,2000);
+  const file = S.pending;
+  if(!text && !file) return;
+  const m = {
+    id: S.myId+'-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,8),
+    fromId: S.myId, from: S.name, text, ts: Date.now(), replyTo: S.replyTo, file: null
+  };
+  if(file){
+    try{ m.file = {name:file.name, type:file.type, size:file.size, data: await file.arrayBuffer()}; }
+    catch{ alert('Could not read this file.'); return; }
   }
+  $('#chatIn').value = ''; setPending(null); setReply(null);
+  addMsg(m);
+  broadcast({t:'chat', m: wireMsg(m)});
+  $('#msgs').scrollTop = $('#msgs').scrollHeight;
+}
+
+function setPending(file){
+  if(file && file.size>FILE_MAX){ alert('This file is too big. The limit is '+fmtSize(FILE_MAX)+'.'); file = null; }
+  S.pending = file || null;
+  $('#pendBar').classList.toggle('hidden', !S.pending);
+  if(S.pending) $('#pendTxt').textContent = '📎 '+S.pending.name+' ('+fmtSize(S.pending.size)+')';
+  $('#fileIn').value = '';
+}
+function quoteOf(id){
+  const o = S.chat.find(x=>x.id===id);
+  if(!o) return 'Original message was deleted';
+  return o.from+': '+(o.text || '📎 '+o.file.name);
+}
+function setReply(id){
+  S.replyTo = id;
+  $('#replyBar').classList.toggle('hidden', !id);
+  if(id){ $('#replyTxt').textContent = '↩ Replying to '+quoteOf(id); $('#chatIn').focus(); }
+}
+
+// text with clickable http(s) links; built from text nodes, never HTML
+function linkify(el, text){
+  const re = /\bhttps?:\/\/[^\s<>"]+/gi;
+  let last = 0, m;
+  while((m = re.exec(text))){
+    let url = m[0].replace(/[.,!?;:)\]}'"]+$/, '');
+    el.append(text.slice(last, m.index));
+    const a = document.createElement('a');
+    a.href = url; a.textContent = url; a.target = '_blank'; a.rel = 'noopener noreferrer';
+    el.append(a);
+    last = m.index + url.length; re.lastIndex = last;
+  }
+  el.append(text.slice(last));
+}
+
+function buildMsg(m){
+  const d = document.createElement('div'); d.className='msg'; d.dataset.id = m.id;
+  const mine = m.fromId===S.myId;
+  const who = document.createElement('div'); who.className='who';
+  who.textContent = mine ? m.from+' (you)' : m.from; who.style.color = color(m.from);
+  const when = document.createElement('span'); when.className='when';
+  when.textContent = new Date(m.ts).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+  who.appendChild(when);
+  const acts = document.createElement('div'); acts.className='acts';
+  const rb = document.createElement('button'); rb.type='button'; rb.textContent='↩ Reply'; rb.onclick = ()=>setReply(m.id);
+  acts.appendChild(rb);
+  if(mine){ const db = document.createElement('button'); db.type='button'; db.textContent='🗑 Delete'; db.onclick = ()=>deleteMsg(m.id); acts.appendChild(db); }
+  d.append(who, acts);
+  if(m.replyTo){
+    const q = document.createElement('div'); q.className='quote';
+    q.onclick = ()=>{
+      const t = S.msgEls.get(m.replyTo); if(!t) return;
+      t.scrollIntoView({block:'center', behavior:'smooth'});
+      t.classList.add('flash'); setTimeout(()=>t.classList.remove('flash'), 1200);
+    };
+    d.appendChild(q); d._quote = q;
+  }
+  if(m.text){ const txt = document.createElement('div'); txt.className='txt'; linkify(txt, m.text); d.appendChild(txt); }
+  if(m.file){
+    const att = document.createElement('div'); att.className='att';
+    const t = m.file.type, inline = INLINE.test(t);
+    if(inline && t.startsWith('image/')){
+      const img = document.createElement('img'); img.src = m.url; img.alt = m.file.name; img.loading='lazy';
+      img.onclick = ()=>{ const v=$('#viewer'); v.querySelector('img').src = m.url; v.classList.remove('hidden'); };
+      att.appendChild(img);
+    }else if(inline && t.startsWith('video/')){
+      const v = document.createElement('video'); v.src = m.url; v.controls = true; v.preload='metadata'; att.appendChild(v);
+    }else if(inline && t.startsWith('audio/')){
+      const a = document.createElement('audio'); a.src = m.url; a.controls = true; a.preload='metadata';
+      a.style.display = 'block'; att.appendChild(a);
+    }
+    // always offer a download
+    const a = document.createElement('a'); a.className='file'; a.href = m.url; a.download = m.file.name;
+    const fn = document.createElement('span'); fn.className='fn'; fn.textContent = '📄 '+m.file.name;
+    const fs = document.createElement('span'); fs.className='fs2'; fs.textContent = fmtSize(m.file.size)+' · Download';
+    a.append(fn, fs);
+    if(inline) a.style.marginTop = '6px';
+    att.appendChild(a);
+    d.appendChild(att);
+  }
+  return d;
+}
+
+// draws on the next frame, so a burst of history messages draws once
+function renderChat(){
+  if(S.chatRaf) return;
+  S.chatRaf = requestAnimationFrame(()=>{ S.chatRaf = 0; drawChat(); });
+}
+function drawChat(){
+  const box = $('#msgs');
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 60;
+  let em = box.querySelector('.empty');
+  if(!S.chat.length && !em){ em = document.createElement('div'); em.className='empty'; em.textContent='No messages yet. Say hi!'; box.appendChild(em); }
+  if(S.chat.length && em) em.remove();
+  // reuse existing message elements, so playing videos and audio are not interrupted
+  let prev = null;
   S.chat.forEach(m=>{
-    const d = document.createElement('div'); d.className='msg';
-    const who = document.createElement('div'); who.className='who';
-    who.textContent = m.mine ? m.from+' (you)' : m.from; who.style.color = color(m.from);
-    const when = document.createElement('span'); when.className='when';
-    when.textContent = new Date(m.ts).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
-    who.appendChild(when);
-    const txt = document.createElement('div'); txt.className='txt'; txt.textContent = m.text;
-    d.append(who, txt); box.appendChild(d);
+    let el = S.msgEls.get(m.id);
+    if(!el){ el = buildMsg(m); S.msgEls.set(m.id, el); }
+    const want = prev ? prev.nextSibling : box.firstChild;
+    if(el!==want) box.insertBefore(el, want);
+    if(el._quote) el._quote.textContent = '↪ '+quoteOf(m.replyTo);
+    prev = el;
   });
   if(atBottom) box.scrollTop = box.scrollHeight;
   const un = $('#unread');
   un.textContent = S.unread>99 ? '99+' : S.unread;
   un.classList.toggle('hidden', S.unread===0);
 }
+function clearChat(){
+  S.chat.forEach(m=>{ if(m.url) URL.revokeObjectURL(m.url); });
+  S.chat = []; S.chatIds.clear(); S.msgEls.clear(); S.unread = 0;
+  $('#msgs').innerHTML = ''; $('#chatIn').value = '';
+  setPending(null); setReply(null);
+}
 function toggleChat(open){
   const c = $('#chat');
   const show = open===undefined ? c.classList.contains('hidden') : open;
   c.classList.toggle('hidden', !show);
   $('#btnChat').classList.toggle('on', show);
-  if(show){ S.unread = 0; renderChat(); $('#msgs').scrollTop = $('#msgs').scrollHeight; $('#chatIn').focus(); }
+  if(show){ S.unread = 0; drawChat(); $('#msgs').scrollTop = $('#msgs').scrollHeight; $('#chatIn').focus(); }
 }
 
 /* ---------- speaking detection ---------- */
@@ -716,8 +892,8 @@ function leave(msg){
   document.querySelectorAll('#stage .screen').forEach(ch=>{ if(ch._amp) ch._amp.stop(); });
   $('#stage').innerHTML='';
   // history stays only with the people still in the room
-  S.chat=[]; S.chatIds.clear(); S.unread=0;
-  toggleChat(false); $('#chatIn').value='';
+  clearChat();
+  toggleChat(false);
   setErr(msg||'');
 }
 
@@ -731,7 +907,22 @@ $('#btnShare').onclick  = toggleShare;
 $('#btnCam').onclick    = toggleCam;
 $('#btnChat').onclick   = ()=>toggleChat();
 $('#chatClose').onclick = ()=>toggleChat(false);
-$('#chatForm').onsubmit = e=>{ e.preventDefault(); sendChat($('#chatIn').value); $('#chatIn').value=''; };
+$('#chatForm').onsubmit = e=>{ e.preventDefault(); sendChat(); };
+$('#btnAttach').onclick = ()=>$('#fileIn').click();
+$('#fileIn').onchange   = e=>setPending(e.target.files[0]);
+$('#pendX').onclick     = ()=>setPending(null);
+$('#replyX').onclick    = ()=>setReply(null);
+$('#viewer').onclick    = ()=>{ $('#viewer').classList.add('hidden'); $('#viewer img').removeAttribute('src'); };
+// paste or drop a file into the chat to attach it
+$('#chatIn').addEventListener('paste', e=>{ const f = e.clipboardData && e.clipboardData.files[0]; if(f){ e.preventDefault(); setPending(f); } });
+$('#chat').addEventListener('dragover', e=>{ if(e.dataTransfer.types.includes('Files')){ e.preventDefault(); $('#chat').classList.add('drop'); } });
+$('#chat').addEventListener('dragleave', e=>{ if(!$('#chat').contains(e.relatedTarget)) $('#chat').classList.remove('drop'); });
+$('#chat').addEventListener('drop', e=>{ e.preventDefault(); $('#chat').classList.remove('drop'); const f = e.dataTransfer.files[0]; if(f) setPending(f); });
+document.addEventListener('keydown', e=>{
+  if(e.key!=='Escape') return;
+  if(!$('#viewer').classList.contains('hidden')) $('#viewer').onclick();
+  else if(S.replyTo) setReply(null);
+});
 $('#btnLeave').onclick  = ()=>leave();
 $('#btnSet').onclick    = ()=>$('#settings').classList.toggle('hidden');
 $('#micSel').onchange   = changeMic;
