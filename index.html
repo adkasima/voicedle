@@ -202,6 +202,17 @@ audio{display:none}
       <div class="lvl" aria-hidden="true"><div class="lvl-fill" id="lvlFill"></div><div class="lvl-mark" id="lvlMark"></div></div>
       <input type="range" id="sens" min="-100" max="0" step="1" value="-60">
       <div class="set-hint">Your voice is sent only when it is louder than the white line. Slide fully left to always send.</div>
+      <label for="fxSel">Voice effect <span class="pct" id="fxTxt"></span></label>
+      <select id="fxSel">
+        <option value="none">None</option>
+        <option value="reverb">Reverb (big room)</option>
+        <option value="echo">Echo</option>
+        <option value="robot">Robot</option>
+        <option value="radio">Radio / walkie-talkie</option>
+        <option value="deep">Deep voice</option>
+        <option value="chipmunk">Chipmunk</option>
+      </select>
+      <label class="chk"><input type="checkbox" id="hearMe"> Hear my own voice (to test effects, use headphones)</label>
       <label for="vol">Volume of everyone (voices and shared screens) <span class="pct" id="volPct">100%</span></label>
       <input type="range" id="vol" min="0" max="500" step="5" value="100">
       <label class="chk"><input type="checkbox" id="sfx" checked> Sound effects (joins, leaves, mute, sharing, messages)</label>
@@ -380,7 +391,38 @@ class Gate extends AudioWorkletProcessor{
     return true;
   }
 }
-registerProcessor('voicedle-gate', Gate);`;
+registerProcessor('voicedle-gate', Gate);
+
+// Pitch shifter: two read heads sweep through a short delay line at a different speed
+// than it is written, and fade over each other to hide the jumps.
+class Pitch extends AudioWorkletProcessor{
+  constructor(o){
+    super();
+    this.ratio = (o.processorOptions && o.processorOptions.ratio) || 1;
+    this.N = 4096; this.buf = new Float32Array(this.N); this.w = 0;
+    this.L = 2048; this.p = 0;
+  }
+  read(d){
+    let x = this.w - d; while(x<0) x += this.N;
+    const i = Math.floor(x), f = x - i, j = (i+1) % this.N;
+    return this.buf[i]*(1-f) + this.buf[j]*f;
+  }
+  process(inputs, outputs){
+    const inp = inputs[0], out = outputs[0];
+    if(!inp || !inp.length) return true;
+    const a = inp[0], dp = (1-this.ratio)/this.L;
+    for(let i=0;i<a.length;i++){
+      this.buf[this.w] = a[i];
+      const p1 = this.p, p2 = (this.p+0.5) % 1;
+      const y = this.read(p1*this.L+1)*Math.sin(Math.PI*p1) + this.read(p2*this.L+1)*Math.sin(Math.PI*p2);
+      for(let c=0;c<out.length;c++) out[c][i] = y;
+      this.w = (this.w+1) % this.N;
+      this.p = ((this.p+dp) % 1 + 1) % 1;
+    }
+    return true;
+  }
+}
+registerProcessor('voicedle-pitch', Pitch);`;
 
 async function buildMicChain(raw){
   try{
@@ -391,7 +433,12 @@ async function buildMicChain(raw){
     S.gate.port.postMessage(sensValue());
     S.gate.port.onmessage = e=>showLevel(e.data);
     const dest = S.ac.createMediaStreamDestination();
-    S.gate.connect(dest);
+    S.fxIn = S.ac.createGain(); S.fxOut = S.ac.createGain();
+    S.monitor = S.ac.createGain(); S.monitor.gain.value = $('#hearMe').checked ? 1 : 0;
+    S.gate.connect(S.fxIn);
+    S.fxOut.connect(dest);
+    S.fxOut.connect(S.monitor); S.monitor.connect(S.ac.destination);
+    setEffect($('#fxSel').value);
     S.micSrc = S.ac.createMediaStreamSource(raw);
     S.micSrc.connect(S.gate);
     return dest.stream;
@@ -399,9 +446,59 @@ async function buildMicChain(raw){
     // browser without audio worklets: send the mic as it is
     S.gate = null;
     $('#sensTxt').textContent = '(not supported in this browser)';
+    $('#fxTxt').textContent = '(not supported in this browser)'; $('#fxSel').disabled = true;
     return raw;
   }
 }
+/* ---------- voice effects ---------- */
+// Each effect is built between S.fxIn and S.fxOut, on the voice you send.
+function reverbImpulse(ac, secs, decay){
+  const len = Math.floor(ac.sampleRate*secs), b = ac.createBuffer(2, len, ac.sampleRate);
+  for(let c=0;c<2;c++){ const d = b.getChannelData(c); for(let i=0;i<len;i++) d[i] = (Math.random()*2-1)*Math.pow(1-i/len, decay); }
+  return b;
+}
+const EFFECTS = {
+  none(ac, inp, out){ inp.connect(out); return []; },
+  reverb(ac, inp, out){
+    const dry = ac.createGain(), wet = ac.createGain(), conv = ac.createConvolver();
+    dry.gain.value = 0.8; wet.gain.value = 1.2; conv.buffer = reverbImpulse(ac, 2.8, 2.5);
+    inp.connect(dry); dry.connect(out); inp.connect(conv); conv.connect(wet); wet.connect(out);
+    return [dry, wet, conv];
+  },
+  echo(ac, inp, out){
+    const d = ac.createDelay(1), fb = ac.createGain(), wet = ac.createGain();
+    d.delayTime.value = 0.32; fb.gain.value = 0.45; wet.gain.value = 0.7;
+    inp.connect(out); inp.connect(d); d.connect(fb); fb.connect(d); d.connect(wet); wet.connect(out);
+    return [d, fb, wet];
+  },
+  robot(ac, inp, out){
+    // short metallic comb, then ring modulation (voice multiplied by a 50 Hz tone)
+    const d = ac.createDelay(0.1), fb = ac.createGain(), ring = ac.createGain(), osc = ac.createOscillator(), boost = ac.createGain();
+    d.delayTime.value = 0.011; fb.gain.value = 0.55; ring.gain.value = 0; osc.frequency.value = 50; boost.gain.value = 1.6;
+    inp.connect(ring); inp.connect(d); d.connect(fb); fb.connect(d); d.connect(ring);
+    osc.connect(ring.gain); osc.start();
+    ring.connect(boost); boost.connect(out);
+    return [d, fb, ring, osc, boost];
+  },
+  radio(ac, inp, out){
+    const hp = ac.createBiquadFilter(), lp = ac.createBiquadFilter(), sh = ac.createWaveShaper(), g = ac.createGain();
+    hp.type = 'highpass'; hp.frequency.value = 450; lp.type = 'lowpass'; lp.frequency.value = 2800;
+    const k = 25, curve = new Float32Array(1024);
+    for(let i=0;i<1024;i++){ const x = i/511.5-1; curve[i] = (1+k)*x/(1+k*Math.abs(x)); }
+    sh.curve = curve; g.gain.value = 0.7;
+    inp.connect(hp); hp.connect(lp); lp.connect(sh); sh.connect(g); g.connect(out);
+    return [hp, lp, sh, g];
+  },
+  deep(ac, inp, out){ const p = new AudioWorkletNode(ac, 'voicedle-pitch', {processorOptions:{ratio:0.7}}); inp.connect(p); p.connect(out); return [p]; },
+  chipmunk(ac, inp, out){ const p = new AudioWorkletNode(ac, 'voicedle-pitch', {processorOptions:{ratio:1.6}}); inp.connect(p); p.connect(out); return [p]; }
+};
+function setEffect(name){
+  if(!S.fxIn) return;
+  try{ S.fxIn.disconnect(); }catch{}
+  (S.fxNodes||[]).forEach(n=>{ try{ n.stop && n.stop(); }catch{} try{ n.disconnect(); }catch{} });
+  S.fxNodes = (EFFECTS[name] || EFFECTS.none)(S.ac, S.fxIn, S.fxOut);
+}
+
 function sensValue(){ return +$('#sens').value; }
 function showSens(){
   const v = sensValue();
@@ -1045,7 +1142,7 @@ function leave(msg){
   clearInterval(S.meterTimer); S.meters.clear();
   // close the audio a moment later, so the leave sound can finish
   const ac = S.ac; if(ac) setTimeout(()=>{ try{ ac.close(); }catch{} }, 500);
-  S.peer=null; S.local=null; S.mic=null; S.micSrc=null; S.gate=null; S.ac=null; S.muted=false; S.deaf=false;
+  S.peer=null; S.local=null; S.mic=null; S.micSrc=null; S.gate=null; S.fxIn=null; S.fxOut=null; S.fxNodes=null; S.monitor=null; S.ac=null; S.muted=false; S.deaf=false;
   $('#settings').classList.add('hidden');
   $('#room').classList.add('hidden');
   $('#join').classList.remove('hidden');
@@ -1055,6 +1152,7 @@ function leave(msg){
   clearChat();
   toggleChat(false);
   S.leaving = false;
+  $('#hearMe').checked = false; // never start the next call hearing yourself
   setErr(msg||'');
 }
 
@@ -1095,6 +1193,9 @@ try{ if(localStorage.getItem('voicedle-sfx')==='0') $('#sfx').checked = false; }
 $('#sfxVol').oninput    = e=>{ $('#sfxPct').textContent = e.target.value+'%'; try{ localStorage.setItem('voicedle-sfxvol', e.target.value); }catch{} };
 $('#sfxVol').onchange   = ()=>sfx('join'); // play a sample when you let go
 try{ const v = localStorage.getItem('voicedle-sfxvol'); if(v!==null){ $('#sfxVol').value = v; $('#sfxPct').textContent = v+'%'; } }catch{}
+$('#fxSel').onchange    = ()=>{ setEffect($('#fxSel').value); try{ localStorage.setItem('voicedle-fx', $('#fxSel').value); }catch{} };
+$('#hearMe').onchange   = ()=>{ if(S.monitor) S.monitor.gain.value = $('#hearMe').checked ? 1 : 0; };
+try{ const fx = localStorage.getItem('voicedle-fx'); if(fx && EFFECTS[fx]) $('#fxSel').value = fx; }catch{}
 $('#vol').oninput       = e=>{ S.volume = e.target.value/100; $('#volPct').textContent = e.target.value+'%'; applyVolumes(); };
 $('#btnCopy').onclick   = async ()=>{
   const link = location.protocol.startsWith('http') ? location.origin+location.pathname+'#'+S.code : S.code;
