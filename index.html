@@ -78,6 +78,7 @@ footer{display:flex;justify-content:center;gap:10px;padding:12px;border-top:1px 
 .lvl-fill{position:absolute;left:0;top:0;bottom:0;width:0;background:var(--muted)}
 .lvl-fill.open{background:var(--live)}
 .lvl-mark{position:absolute;top:0;bottom:0;width:2px;background:#fff}
+.chk{display:flex;align-items:center;gap:8px;color:var(--text);font-size:14px;margin-top:16px;cursor:pointer}
 .set-hint{font-size:12px;color:var(--muted);margin-top:2px}
 audio{display:none}
 .svol{position:absolute;left:10px;bottom:10px;display:flex;align-items:center;gap:8px;background:rgba(18,20,26,.85);border:1px solid var(--line);border-radius:8px;padding:5px 10px}
@@ -203,6 +204,7 @@ audio{display:none}
       <div class="set-hint">Your voice is sent only when it is louder than the white line. Slide fully left to always send.</div>
       <label for="vol">Volume of everyone (voices and shared screens) <span class="pct" id="volPct">100%</span></label>
       <input type="range" id="vol" min="0" max="500" step="5" value="100">
+      <label class="chk"><input type="checkbox" id="sfx" checked> Sound effects (joins, leaves, mute, sharing, messages)</label>
     </div>
   </footer>
 </div>
@@ -286,6 +288,41 @@ function volSlider(value, label, onChange){
   rg.oninput = ()=>{ pct.textContent = rg.value+'%'; onChange(rg.value/100); };
   rg.ondblclick = ()=>{ rg.value = 100; rg.oninput(); };
   return [rg, pct];
+}
+
+/* ---------- sound effects ---------- */
+// Short tones made with Web Audio, played only on this computer.
+// Each sound is a list of [frequency in Hz, start in seconds, length in seconds].
+const SFX = {
+  join:     [[523,0,.12],[784,.1,.2]],
+  leave:    [[784,0,.12],[523,.1,.2]],
+  mute:     [[440,0,.08],[330,.07,.12]],
+  unmute:   [[330,0,.08],[440,.07,.12]],
+  deaf:     [[392,0,.1],[262,.08,.16]],
+  undeaf:   [[262,0,.1],[392,.08,.16]],
+  shareOn:  [[523,0,.09],[659,.08,.09],[784,.16,.18]],
+  shareOff: [[784,0,.09],[659,.08,.09],[523,.16,.18]],
+  camOn:    [[659,0,.08],[880,.07,.14]],
+  camOff:   [[880,0,.08],[659,.07,.14]],
+  msg:      [[988,0,.06],[1319,.05,.1]]
+};
+const sfxLast = {};
+function sfx(name){
+  const ac = S.ac;
+  if(!ac || S.leaving || !$('#sfx').checked) return;
+  const now = performance.now();
+  if(sfxLast[name] && now-sfxLast[name] < 150) return; // a burst of events plays once
+  sfxLast[name] = now;
+  const t0 = ac.currentTime + 0.01;
+  SFX[name].forEach(([f, at, len])=>{
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = 'sine'; o.frequency.value = f;
+    g.gain.setValueAtTime(0, t0+at);
+    g.gain.linearRampToValueAtTime(0.14, t0+at+0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0+at+len);
+    o.connect(g); g.connect(ac.destination);
+    o.start(t0+at); o.stop(t0+at+len+0.02);
+  });
 }
 
 /* ---------- start / join ---------- */
@@ -416,6 +453,9 @@ function enterRoom(){
   loadDevices();
   renderChat();
   render();
+  // people already in the room greet you right away; only your own join sound plays
+  S.enteredAt = performance.now();
+  sfx('join');
 }
 
 /* ---------- connections ---------- */
@@ -452,13 +492,13 @@ function setupConn(c){
 
 function onData(id,d){
   const e = entry(id);
-  if(d.t==='hello'){ e.name=d.name; e.muted=d.muted; e.deaf=d.deaf; }
+  if(d.t==='hello'){ if(!e.hello){ e.hello = true; if(performance.now()-S.enteredAt > 3000) sfx('join'); } e.name=d.name; e.muted=d.muted; e.deaf=d.deaf; }
   else if(d.t==='state'){ e.muted=d.muted; e.deaf=d.deaf; }
   else if(d.t==='peers'){ d.list.forEach(pid=>{ if(pid!==S.myId) connectTo(pid); }); }
-  else if(d.t==='screen-stop'){ e.screen=null; if(e.screenCall){ try{e.screenCall.close();}catch{} e.screenCall=null; } }
-  else if(d.t==='cam-stop'){ e.cam=null; if(e.camCall){ try{e.camCall.close();}catch{} e.camCall=null; } }
+  else if(d.t==='screen-stop'){ if(e.screen) sfx('shareOff'); e.screen=null; if(e.screenCall){ try{e.screenCall.close();}catch{} e.screenCall=null; } }
+  else if(d.t==='cam-stop'){ if(e.cam) sfx('camOff'); e.cam=null; if(e.camCall){ try{e.camCall.close();}catch{} e.camCall=null; } }
   // the author is whoever sent it to us directly, so nobody can post or delete as someone else
-  else if(d.t==='chat'){ if(d.m) addMsg(Object.assign({}, d.m, {fromId:id, ts:Date.now()})); return; }
+  else if(d.t==='chat'){ if(d.m){ addMsg(Object.assign({}, d.m, {fromId:id, ts:Date.now()})); sfx('msg'); } return; }
   else if(d.t==='history'){ if(id===S.hostId && d.m) addMsg(d.m, true); return; }
   else if(d.t==='del'){ const m = S.chat.find(x=>x.id===d.id); if(m && m.fromId===id) removeMsg(d.id); return; }
   render();
@@ -485,11 +525,11 @@ function attachCall(id, call, type){
   }else if(type==='cam'){
     // ignore events from an older call, so a late "close" cannot remove a newer camera
     e.camCall = call;
-    call.on('stream', s=>{ if(e.camCall===call && e.cam!==s){ e.cam=s; render(); } });
+    call.on('stream', s=>{ if(e.camCall===call && e.cam!==s){ if(!e.cam) sfx('camOn'); e.cam=s; render(); } });
     call.on('close', ()=>{ if(e.camCall===call){ e.cam=null; e.camCall=null; render(); } });
   }else{
     e.screenCall = call;
-    call.on('stream', s=>{ if(e.screenCall===call && e.screen!==s){ e.screen=s; s.addEventListener('addtrack', render); render(); } });
+    call.on('stream', s=>{ if(e.screenCall===call && e.screen!==s){ if(!e.screen) sfx('shareOn'); e.screen=s; s.addEventListener('addtrack', render); render(); } });
     call.on('close', ()=>{ if(e.screenCall===call){ e.screen=null; e.screenCall=null; render(); } });
   }
 }
@@ -498,6 +538,7 @@ function removePeer(id){
   const e = S.peers.get(id);
   if(!e) return;
   S.peers.delete(id);
+  if(e.hello) sfx('leave');
   try{ e.conn&&e.conn.close(); }catch{}
   try{ e.voiceCall&&e.voiceCall.close(); }catch{}
   try{ e.screenCall&&e.screenCall.close(); }catch{}
@@ -517,7 +558,8 @@ function applyMute(){
 function pushState(){ broadcast({t:'state', muted:S.muted, deaf:S.deaf}); }
 function toggleMute(){
   S.muted = !S.muted;
-  if(!S.muted && S.deaf) setDeaf(false);
+  if(!S.muted && S.deaf){ setDeaf(false); sfx('undeaf'); }
+  else sfx(S.muted ? 'mute' : 'unmute');
   applyMute(); pushState(); render();
 }
 function setDeaf(v){
@@ -528,6 +570,7 @@ function setDeaf(v){
 function toggleDeaf(){
   if(!S.deaf){ S.wasMuted = S.muted; setDeaf(true); S.muted = true; }
   else { setDeaf(false); S.muted = S.wasMuted; }
+  sfx(S.deaf ? 'deaf' : 'undeaf');
   applyMute(); pushState(); render();
 }
 
@@ -553,6 +596,7 @@ async function toggleShare(){
   vt.contentHint = 'motion';
   vt.addEventListener('ended', stopShare);
   S.peers.forEach((e,id)=>{ if(e.conn && e.conn.open) shareTo(id, 'screen'); });
+  sfx('shareOn');
   render();
 }
 // kind is 'screen' or 'cam'
@@ -593,6 +637,7 @@ function stopShare(){
   S.screenCalls.forEach(c=>{ try{c.close();}catch{} });
   S.screenCalls.clear();
   broadcast({t:'screen-stop'});
+  sfx('shareOff');
   render();
 }
 
@@ -606,6 +651,7 @@ async function toggleCam(){
   }catch(e){ alert('Could not start the camera. Allow camera access in the browser address bar, and close other apps using it.'); return; }
   S.cam.getVideoTracks()[0].addEventListener('ended', stopCam);
   S.peers.forEach((e,id)=>{ if(e.conn && e.conn.open) shareTo(id, 'cam'); });
+  sfx('camOn');
   render();
 }
 function stopCam(){
@@ -615,6 +661,7 @@ function stopCam(){
   S.camCalls.forEach(c=>{ try{c.close();}catch{} });
   S.camCalls.clear();
   broadcast({t:'cam-stop'});
+  sfx('camOff');
   render();
 }
 
@@ -971,6 +1018,8 @@ async function changeMic(){
 
 /* ---------- leave ---------- */
 function leave(msg){
+  if(S.ac) sfx('leave');
+  S.leaving = true;
   stopShare();
   stopCam();
   Array.from(S.peers.keys()).forEach(removePeer);
@@ -978,7 +1027,8 @@ function leave(msg){
   if(S.local) S.local.getTracks().forEach(t=>t.stop());
   if(S.mic) S.mic.getTracks().forEach(t=>t.stop());
   clearInterval(S.meterTimer); S.meters.clear();
-  try{ S.ac&&S.ac.close(); }catch{}
+  // close the audio a moment later, so the leave sound can finish
+  const ac = S.ac; if(ac) setTimeout(()=>{ try{ ac.close(); }catch{} }, 500);
   S.peer=null; S.local=null; S.mic=null; S.micSrc=null; S.gate=null; S.ac=null; S.muted=false; S.deaf=false;
   $('#settings').classList.add('hidden');
   $('#room').classList.add('hidden');
@@ -988,6 +1038,7 @@ function leave(msg){
   // history stays only with the people still in the room
   clearChat();
   toggleChat(false);
+  S.leaving = false;
   setErr(msg||'');
 }
 
@@ -1023,6 +1074,8 @@ $('#micSel').onchange   = changeMic;
 $('#sens').oninput      = ()=>{ showSens(); if(S.gate) S.gate.port.postMessage(sensValue()); try{ localStorage.setItem('voicedle-sens', sensValue()); }catch{} };
 try{ const sv = localStorage.getItem('voicedle-sens'); if(sv!==null) $('#sens').value = sv; }catch{}
 showSens();
+$('#sfx').onchange       = ()=>{ try{ localStorage.setItem('voicedle-sfx', $('#sfx').checked ? '1' : '0'); }catch{} };
+try{ if(localStorage.getItem('voicedle-sfx')==='0') $('#sfx').checked = false; }catch{}
 $('#vol').oninput       = e=>{ S.volume = e.target.value/100; $('#volPct').textContent = e.target.value+'%'; applyVolumes(); };
 $('#btnCopy').onclick   = async ()=>{
   const link = location.protocol.startsWith('http') ? location.origin+location.pathname+'#'+S.code : S.code;
