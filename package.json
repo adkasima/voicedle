@@ -1,0 +1,23 @@
+{
+  "name": "voicedle",
+  "version": "1.0.0",
+  "description": "Voice and screen sharing web application",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adkasima/voicedle.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/adkasima/voicedle/issues"
+  },
+  "homepage": "https://github.com/adkasima/voicedle#readme",
+  "dependencies": {
+    "@vercel/analytics": "^2.0.1"
+  }
+}
